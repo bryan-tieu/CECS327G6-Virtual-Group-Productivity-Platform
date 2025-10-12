@@ -13,7 +13,7 @@ class PlatformServer:
         self.udp_port = udp_port
         self.connected_clients = []
         self.calendar_events = []
-        self.pomoTimer_state = {
+        self.timer_state = {
             "running": False,
             "start_time": None,
             "duration" : 25*60
@@ -73,7 +73,7 @@ class PlatformServer:
     
     # UDP Helper
     def _start_udp_server(self):
-        with socket.socktt(socket.AF_INET, socket.SOCK_DGRAM) as udp_socket:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_socket:
             
             udp_socket.bind((self.host, self.udp_port))
             
@@ -156,7 +156,7 @@ class PlatformServer:
         message_json = json.dumps(message)
         disconnected_clients = []
         
-        for client in self.conneceted_clients:
+        for client in self.connected_clients:
             
             try:
                 
