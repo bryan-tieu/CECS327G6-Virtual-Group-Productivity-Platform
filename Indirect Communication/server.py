@@ -149,7 +149,6 @@ class PlatformServer:
             "timer_state": self.timer_state
         })
         
-    
     # Broadcast TCP messages to clients (users)
     def _broadcast_tcp_message(self, message):
         
@@ -168,7 +167,6 @@ class PlatformServer:
         for client in disconnected_clients:
             self.connected_clients.remove(client)
     
-    
     # Broadcast UDP messages to clients (users)
     def _broadcast_udp_message(self, message, udp_socket):
         
@@ -182,7 +180,18 @@ class PlatformServer:
             
             except:
                 pass
-
+            
+    # Syncing data to clients (users)
+    def _send_sync_data(self, client_socket):
+        
+        sync_data = {
+            "type": "sync_data",
+            "timer_state": self.timer_state,
+            "calendar_events": self.calendar_events
+        }
+        
+        client_socket.send(json.dumps(sync_data).encode())
+    
 if __name__ == "__main__":
     server = PlatformServer()
     server.start_server()
