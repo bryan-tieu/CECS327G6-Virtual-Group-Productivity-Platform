@@ -127,3 +127,62 @@ class PlatformServer:
             
         elif msg_type == "request_sync":
             self._send_sync_data(client_socket)
+            
+    # Timer state control
+    def _handle_timer_control(self, message):
+        
+        action = message.get("action")
+        
+        if action == "start":
+            self.timer_state["running"] = True
+            self.timer_state["start_time"] = time.time()
+            
+        elif action == "stop":
+            self.timer_state["running"] = False
+            
+        elif action == "reset":
+            self.timer_state = {"running": False, "start_time": None, "duration": message.get("duration", 25*60)}
+        
+        # Broadcast timer state to all clients
+        self._broadcast_tcp_message({
+            "type": "timer_update",
+            "timer_state": self.timer_state
+        })
+        
+    
+    # Broadcast TCP messages to clients (users)
+    def _broadcast_tcp_message(self, message):
+        
+        message_json = json.dumps(message)
+        disconnected_clients = []
+        
+        for client in self.conneceted_clients:
+            
+            try:
+                
+                client.send(message_json.encode())
+            
+            except (BrokenPipeError, ConnectionResetError):
+                disconnected_clients.append(client)
+        
+        for client in disconnected_clients:
+            self.connected_clients.remove(client)
+    
+    
+    # Broadcast UDP messages to clients (users)
+    def _broadcast_udp_message(self, message, udp_socket):
+        
+        message_json = json.dumps(message)
+        
+        for client in self.connected_clients:
+            
+            try:
+                client_addr = client.getpeername()
+                udp_socket.sendto(message_json.encode(), client_addr)
+            
+            except:
+                pass
+
+if __name__ == "__main__":
+    server = PlatformServer()
+    server.start_server()
