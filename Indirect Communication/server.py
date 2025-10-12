@@ -109,3 +109,21 @@ class PlatformServer:
                 self.connected_clients.remove(client_socket)
                 
             client_socket.close()
+            
+    # TCP messsages
+    def _process_tcp_message(self, message, client_socket):
+        
+        msg_type = message.get("type")
+        
+        # Call helper functions based on message type
+        if msg_type == "timer_control":
+            self._handle_timer_control(message)
+            
+        elif msg_type == "calendar_event":
+            self._handle_calendar_event(message)
+            
+        elif msg_type == "goal_update":
+            self._handle_goal_update(message)
+            
+        elif msg_type == "request_sync":
+            self._send_sync_data(client_socket)
