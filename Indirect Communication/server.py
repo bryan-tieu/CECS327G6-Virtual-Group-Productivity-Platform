@@ -2,6 +2,7 @@ import socket
 import threading
 import json
 import time
+from datetime import datetime
 
 class PlatformServer:
     
@@ -191,6 +192,32 @@ class PlatformServer:
         }
         
         client_socket.send(json.dumps(sync_data).encode())
+    
+    # Handling calendar events (CRUD)
+    def _handle_calendar_event(self, message):
+        
+        event = message.get("event")
+        event["id"] = len(self.calendar_events) + 1
+        event["created_at"] = datetime.now().isoformat()
+        
+        self.calendar_events.append(event)
+        
+        # Broadcast new event to all clients
+        self._broadcast_tcp_message({
+            "type": "calendar_update",
+            "event": event,
+            "all_events": self.calendar_events
+        })
+    
+    # Handling goal events (CRUD)
+    def _handle_goal_update(self, message):
+        
+        self._broadcast_tcp_message({
+            "type": "goal_update",
+            "goal": message.get("goal"),
+            "user": message.get("user"),
+            "completed": message.get("completed", False)
+        })
     
 if __name__ == "__main__":
     server = PlatformServer()
