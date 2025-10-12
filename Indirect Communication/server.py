@@ -219,6 +219,35 @@ class PlatformServer:
             "completed": message.get("completed", False)
         })
     
+    # Timer updates
+    def _manage_timer(self):
+        
+        while True:
+            
+            if self.timer_state["running"]:
+                
+                elapsed = time.time() - self.timer_state["start_time"]
+                remaining = max(0, self.timer_state["duration"] - elapsed)
+                
+                # Broadcast timer update every second
+                self._broadcast_tcp_message({
+                    "type": "timer_tick",
+                    "remaining_time": remaining,
+                    "timer_state": self.timer_state
+                })
+                
+                # Check if timer completed
+                if remaining <= 0:
+                    
+                    self.timer_state["running"] = False
+                    
+                    self._broadcast_tcp_message({
+                        "type": "timer_complete",
+                        "timer_state": self.timer_state
+                    })
+            
+            time.sleep(1)
+        
 if __name__ == "__main__":
     server = PlatformServer()
     server.start_server()
