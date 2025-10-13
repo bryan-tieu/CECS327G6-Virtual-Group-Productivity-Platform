@@ -14,6 +14,7 @@ class PlatformClient:
         self.tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         #self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.running = True
+        self.active_input = False
 
 
 
@@ -56,8 +57,9 @@ class PlatformClient:
             print(f"[Server] Timer State Updated: {msg["timer_state"]}")
 
         elif msg_type == "timer_tick":
-            mins, secs = divmod(int(msg["remaining_time"]), 60)
-            print(f"[Timer] Remaining: {mins:02d}:{secs:02d}")
+            if not self.active_input:
+                mins, secs = divmod(int(msg["remaining_time"]), 60)
+                print(f"\r[Timer] Remaining: {mins:02d}:{secs:02d}   ", end="", flush=True)
 
         elif msg_type == "timer_complete":
             print("[Timer] Pomodoro session complete")
@@ -89,6 +91,29 @@ class PlatformClient:
             "action": "stop"
         })
 
+    def add_calendar_event(self, title, description, time_str):
+        event = {
+            "title": title,
+            "description": description,
+            "scheduled_time": time_str
+        }
+        self.send_tcp_message({
+            "type": "calendar_event",
+            "event": event
+        })
+
+    def update_goal(self, goal, user, completed=False):
+        self.send_tcp_message({
+            "type": "goal_update",
+            "goal": goal,
+            "user": user,
+            "completed": completed
+        })
+
+    def request_sync(self):
+        self.send_tcp_message({
+            "type": "request_sync"
+        })
 
 
 if __name__ == "__main__":
@@ -97,9 +122,14 @@ if __name__ == "__main__":
 
     #Get user input
     while True:
+        #time.sleep(1)
+
         print("\nCommand Options (Enter number):\n"
         "1. Start Timer\n"
         "2. Stop Timer\n"
+        "3. Add Calendar Event\n"
+        "4. Update Goal\n"
+        "5. Request Sync\n"
         "0. Exit\n")
 
         option = input("Select Option: ")
@@ -109,6 +139,25 @@ if __name__ == "__main__":
 
         elif option == "2":
             client.stop_timer()
+
+        elif option == "3":
+            client.active_input = True
+            title = input("Title: ")
+            desc = input("Description: ")
+            time_str = input("Time (YYYY-MM-DD HH:MM): ")
+            client.add_calendar_event(title, desc, time_str)
+            client.active_input = False
+
+        elif option == "4":
+            client.active_input = True
+            user = input("User: ")
+            goal = input("Goal: ")
+            finish = input("Completed? (y/n): ").lower() == 'y'
+            client.update_goal(goal, user, finish)
+            client.active_input = False
+
+        elif option == "5":
+            client.request_sync()
 
         elif option == "0":
             print("Exiting...")
