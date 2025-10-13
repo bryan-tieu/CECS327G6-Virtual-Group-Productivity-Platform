@@ -10,8 +10,11 @@ class PlatformServer:
     def __init__(self, host='localhost', tcp_port=8000, udp_port = 8001):
         self.host = host
         self.tcp_port = tcp_port
+        self.udp_socket = None
         self.udp_port = udp_port
+        self.udp_clients = set()
         self.connected_clients = []
+        self.lock = threading.Lock()
         self.calendar_events = []
         self.pomoTimer_state = {
             "running": False,
@@ -33,6 +36,11 @@ class PlatformServer:
         udp_thread = threading.Thread(target=self._start_udp_server)
         udp_thread.daemon = True
         udp_thread.start()
+
+        # Timer
+        timer_thread = threading.Thread(target=self._manage_timer)
+        timer_thread.daemon = True
+        timer_thread.start()
         
         try:
             
@@ -41,7 +49,8 @@ class PlatformServer:
                 time.sleep(1)
         
         except KeyboardInterrupt:
-            print("\nKeyboard input detected.\nStopping server...")    
+            print("\nKeyboard input detected.\nStopping server...")
+            self._stop_server    
     
     # TCP helper
     def _start_tcp_server(self):
@@ -61,7 +70,8 @@ class PlatformServer:
                 
                 print(f"TCP Connection established with address: {address}")
                 
-                self.connected_clients.append(client_socket)
+                with self.lock:
+                    self.connected_clients.append(client_socket)
                 
                 client_thread = threading.Thread(
                     target=self._handle_tcp_client,
@@ -73,18 +83,24 @@ class PlatformServer:
     
     # UDP Helper
     def _start_udp_server(self):
-        with socket.socktt(socket.AF_INET, socket.SOCK_DGRAM) as udp_socket:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_socket:
             
             udp_socket.bind((self.host, self.udp_port))
             
             print(f"UDP server listening on {self.host}:{self.udp_port}")
             
             while True:
-                
-                data, address = udp_socket.recvfrom(1024)
-                message = json.loads(data.decode())
-                
-                self._broadcast_udp_message(message, udp_socket)
+                try:                
+                    data, address = udp_socket.recvfrom(1024)
+                    message = json.loads(data.decode())
+                    
+                    with self.lock:
+                        self.udp_clients.add(address)
+
+                    self._broadcast_udp_message(message, udp_socket)
+
+                except OSError:
+                    break
 
     # Client operations for TCP
     def _handle_tcp_client(self, client_socket, address):
@@ -106,8 +122,9 @@ class PlatformServer:
             
         finally:
             
-            if client_socket in self.connected_clients:
-                self.connected_clients.remove(client_socket)
+            with self.lock:
+                if client_socket in self.connected_clients:
+                    self.connected_clients.remove(client_socket)
                 
             client_socket.close()
             
@@ -135,19 +152,26 @@ class PlatformServer:
         action = message.get("action")
         
         if action == "start":
-            self.timer_state["running"] = True
-            self.timer_state["start_time"] = time.time()
+            with self.lock:
+                self.pomoTimer_state["running"] = True
+                self.pomoTimer_state["start_time"] = time.time()
             
         elif action == "stop":
-            self.timer_state["running"] = False
+            with self.lock:
+                self.pomoTimer_state["running"] = False
             
         elif action == "reset":
-            self.timer_state = {"running": False, "start_time": None, "duration": message.get("duration", 25*60)}
+            with self.lock:
+                self.pomoTimer_state = {
+                    "running": False, 
+                    "start_time": None, 
+                    "duration": message.get("duration", 25*60)
+                }
         
         # Broadcast timer state to all clients
         self._broadcast_tcp_message({
             "type": "timer_update",
-            "timer_state": self.timer_state
+            "timer_state": self.pomoTimer_state
         })
         
     # Broadcast TCP messages to clients (users)
@@ -156,38 +180,39 @@ class PlatformServer:
         message_json = json.dumps(message)
         disconnected_clients = []
         
-        for client in self.conneceted_clients:
-            
-            try:
+        with self.lock:
+            for client in self.connected_clients:
                 
-                client.send(message_json.encode())
+                try:
+                    
+                    client.send(message_json.encode())
+                
+                except (BrokenPipeError, ConnectionResetError):
+                    disconnected_clients.append(client)
             
-            except (BrokenPipeError, ConnectionResetError):
-                disconnected_clients.append(client)
-        
-        for client in disconnected_clients:
-            self.connected_clients.remove(client)
+            for client in disconnected_clients:
+                self.connected_clients.remove(client)
     
     # Broadcast UDP messages to clients (users)
     def _broadcast_udp_message(self, message, udp_socket):
         
         message_json = json.dumps(message)
         
-        for client in self.connected_clients:
-            
-            try:
-                client_addr = client.getpeername()
-                udp_socket.sendto(message_json.encode(), client_addr)
-            
-            except:
-                pass
-            
+        with self.lock:
+            for client_addr in self.udp_clients:
+                
+                try:
+                    udp_socket.sendto(message_json.encode(), client_addr)
+                
+                except:
+                    pass
+                
     # Syncing data to clients (users)
     def _send_sync_data(self, client_socket):
         
         sync_data = {
             "type": "sync_data",
-            "timer_state": self.timer_state,
+            "timer_state": self.pomoTimer_state,
             "calendar_events": self.calendar_events
         }
         
@@ -200,7 +225,8 @@ class PlatformServer:
         event["id"] = len(self.calendar_events) + 1
         event["created_at"] = datetime.now().isoformat()
         
-        self.calendar_events.append(event)
+        with self.lock:
+            self.calendar_events.append(event)
         
         # Broadcast new event to all clients
         self._broadcast_tcp_message({
@@ -223,31 +249,45 @@ class PlatformServer:
     def _manage_timer(self):
         
         while True:
-            
-            if self.timer_state["running"]:
-                
-                elapsed = time.time() - self.timer_state["start_time"]
-                remaining = max(0, self.timer_state["duration"] - elapsed)
-                
-                # Broadcast timer update every second
-                self._broadcast_tcp_message({
-                    "type": "timer_tick",
-                    "remaining_time": remaining,
-                    "timer_state": self.timer_state
-                })
-                
-                # Check if timer completed
-                if remaining <= 0:
+            with self.lock:
+                if self.pomoTimer_state["running"]:
                     
-                    self.timer_state["running"] = False
+                    elapsed = time.time() - self.pomoTimer_state["start_time"]
+                    remaining = max(0, self.pomoTimer_state["duration"] - elapsed)
                     
+                    # Broadcast timer update every second
                     self._broadcast_tcp_message({
-                        "type": "timer_complete",
-                        "timer_state": self.timer_state
+                        "type": "timer_tick",
+                        "remaining_time": remaining,
+                        "timer_state": self.pomoTimer_state
                     })
+                    
+                    # Check if timer completed
+                    if remaining <= 0:
+                        
+                        self.pomoTimer_state["running"] = False
+                        
+                        self._broadcast_tcp_message({
+                            "type": "timer_complete",
+                            "timer_state": self.pomoTimer_state
+                        })
             
             time.sleep(1)
-        
+
+    def _stop_server(self):
+        with self.lock:
+            for client in self.connected_clients:
+                try:
+                    client.close()
+                except:
+                    pass
+            
+            if self.udp_socket:
+                try:
+                    self.udp_socket.close()
+                except:
+                    pass
+                
 if __name__ == "__main__":
     server = PlatformServer()
     server.start_server()
