@@ -33,6 +33,11 @@ class PlatformServer:
         udp_thread = threading.Thread(target=self._start_udp_server)
         udp_thread.daemon = True
         udp_thread.start()
+
+        #Timer tick
+        timer_thread = threading.Thread(target=self._manage_timer)
+        timer_thread.daemon = True
+        timer_thread.start()
         
         try:
             
