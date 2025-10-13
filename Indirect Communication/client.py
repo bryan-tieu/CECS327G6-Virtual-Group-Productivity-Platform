@@ -91,6 +91,12 @@ class PlatformClient:
             "action": "stop"
         })
 
+    def reset_timer(self):
+        self.send_tcp_message({
+        "type": "timer_control",
+        "action": "reset",
+    })
+
     def add_calendar_event(self, title, description, time_str):
         event = {
             "title": title,
@@ -127,9 +133,10 @@ if __name__ == "__main__":
         print("\nCommand Options (Enter number):\n"
         "1. Start Timer\n"
         "2. Stop Timer\n"
-        "3. Add Calendar Event\n"
-        "4. Update Goal\n"
-        "5. Request Sync\n"
+        "3. Reset Timer\n"
+        "4. Add Calendar Event\n"
+        "5. Update Goal\n"
+        "6. Request Sync\n"
         "0. Exit\n")
 
         option = input("Select Option: ")
@@ -141,6 +148,9 @@ if __name__ == "__main__":
             client.stop_timer()
 
         elif option == "3":
+            client.reset_timer()
+
+        elif option == "4":
             client.active_input = True
             title = input("Title: ")
             desc = input("Description: ")
@@ -148,7 +158,7 @@ if __name__ == "__main__":
             client.add_calendar_event(title, desc, time_str)
             client.active_input = False
 
-        elif option == "4":
+        elif option == "5":
             client.active_input = True
             user = input("User: ")
             goal = input("Goal: ")
@@ -156,7 +166,7 @@ if __name__ == "__main__":
             client.update_goal(goal, user, finish)
             client.active_input = False
 
-        elif option == "5":
+        elif option == "6":
             client.request_sync()
 
         elif option == "0":
