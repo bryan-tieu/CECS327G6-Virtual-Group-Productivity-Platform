@@ -10,7 +10,7 @@ from pubsub import publish
 class PlatformServer:
     
     # Init
-    def __init__(self, host='localhost', tcp_port=8000, udp_port = 8001):
+    def __init__(self, host='localhost', tcp_port=9000, udp_port = 9001):
         self.host = host
         self.tcp_port = tcp_port
         self.udp_socket = None
@@ -163,7 +163,7 @@ class PlatformServer:
             with self.lock:
                 self.pomoTimer_state["running"] = False
             
-        elif action == "reset":
+        elif action == "set":
             with self.lock:
                 self.pomoTimer_state = {
                     "running": False, 
@@ -201,7 +201,7 @@ class PlatformServer:
     # Broadcast TCP messages to clients (users)
     def _broadcast_tcp_message(self, message):
         
-        message_json = json.dumps(message)
+        message_json = json.dumps(message, default=str)
         disconnected_clients = []
         
         with self.lock:
