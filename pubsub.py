@@ -2,21 +2,16 @@
 import redis
 import threading
 import json
+import datetime
 
 # Redis client
-try:
-    r = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
-    r.ping()
-except redis.ConnectionError:
-    print("Redis connection error")
-    r = None
+r = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+
 
 def publish(channel: str, message: dict):
-    """Publish a message to a Redis channel"""
-    r.publish(channel, json.dumps(message))
+    r.publish(channel, json.dumps(message, default=str))
 
 def subscribe(channel: str, callback):
-    """Subscribe to a Redis channel and call callback(channel, message) for each message"""
     pubsub = r.pubsub()
     pubsub.subscribe(channel)
 
