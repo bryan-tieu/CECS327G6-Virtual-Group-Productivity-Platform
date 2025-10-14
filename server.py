@@ -10,7 +10,7 @@ from pubsub import publish
 class PlatformServer:
     
     # Init
-    def __init__(self, host='localhost', tcp_port=9000, udp_port = 9001):
+    def __init__(self, host='0.0.0.0', tcp_port=9000, udp_port = 9001):
         self.host = host
         self.tcp_port = tcp_port
         self.udp_socket = None
