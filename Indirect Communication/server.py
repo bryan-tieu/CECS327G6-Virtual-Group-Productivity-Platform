@@ -249,32 +249,28 @@ class PlatformServer:
     def _manage_timer(self):
         
         while True:
-            #Read states using lock
             with self.lock:
-                running = self.pomoTimer_state["running"]
-                start_time = self.pomoTimer_state["start_time"]
-                duration = self.pomoTimer_state["duration"]
-
-            if running:
-                elapsed = time.time() - start_time
-                remaining = max(0, duration - elapsed)
-                
-                # Broadcast timer update every second
-                self._broadcast_tcp_message({
-                    "type": "timer_tick",
-                    "remaining_time": remaining,
-                    "timer_state": self.pomoTimer_state
-                })
-                
-                # Check if timer completed
-                if remaining <= 0:
-                    with self.lock:
-                        self.pomoTimer_state["running"] = False
-                        
+                if self.pomoTimer_state["running"]:
+                    
+                    elapsed = time.time() - self.pomoTimer_state["start_time"]
+                    remaining = max(0, self.pomoTimer_state["duration"] - elapsed)
+                    
+                    # Broadcast timer update every second
                     self._broadcast_tcp_message({
-                        "type": "timer_complete",
+                        "type": "timer_tick",
+                        "remaining_time": remaining,
                         "timer_state": self.pomoTimer_state
                     })
+                    
+                    # Check if timer completed
+                    if remaining <= 0:
+                        
+                        self.pomoTimer_state["running"] = False
+                        
+                        self._broadcast_tcp_message({
+                            "type": "timer_complete",
+                            "timer_state": self.pomoTimer_state
+                        })
             
             time.sleep(1)
 
