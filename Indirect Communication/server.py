@@ -1,16 +1,13 @@
-# server.py
 import socket
 import threading
 import json
 import time
-from datetime import datetime, timezone
-
-from pubsub import publish
+from datetime import datetime
 
 class PlatformServer:
     
     # Init
-    def __init__(self, host='0.0.0.0', tcp_port=9000, udp_port = 9001):
+    def __init__(self, host='localhost', tcp_port=8000, udp_port = 8001):
         self.host = host
         self.tcp_port = tcp_port
         self.udp_socket = None
@@ -53,7 +50,7 @@ class PlatformServer:
         
         except KeyboardInterrupt:
             print("\nKeyboard input detected.\nStopping server...")
-            self._stop_server()
+            self._stop_server    
     
     # TCP helper
     def _start_tcp_server(self):
@@ -86,24 +83,24 @@ class PlatformServer:
     
     # UDP Helper
     def _start_udp_server(self):
-        self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_socket:
             
-        self.udp_socket.bind((self.host, self.udp_port))
+            udp_socket.bind((self.host, self.udp_port))
             
-        print(f"UDP server listening on {self.host}:{self.udp_port}")
+            print(f"UDP server listening on {self.host}:{self.udp_port}")
             
-        while True:
-            try:
-                data, address = self.udp_socket.recvfrom(1024)
-                message = json.loads(data.decode())
+            while True:
+                try:                
+                    data, address = udp_socket.recvfrom(1024)
+                    message = json.loads(data.decode())
                     
-                with self.lock:
-                    self.udp_clients.add(address)
+                    with self.lock:
+                        self.udp_clients.add(address)
 
-                self._broadcast_udp_message(message, self.udp_socket)
+                    self._broadcast_udp_message(message, udp_socket)
 
-            except OSError:
-                break
+                except OSError:
+                    break
 
     # Client operations for TCP
     def _handle_tcp_client(self, client_socket, address):
@@ -131,7 +128,7 @@ class PlatformServer:
                 
             client_socket.close()
             
-    # TCP messages
+    # TCP messsages
     def _process_tcp_message(self, message, client_socket):
         
         msg_type = message.get("type")
@@ -157,13 +154,13 @@ class PlatformServer:
         if action == "start":
             with self.lock:
                 self.pomoTimer_state["running"] = True
-                self.pomoTimer_state["start_time"] = datetime.now(timezone.utc)
+                self.pomoTimer_state["start_time"] = time.time()
             
         elif action == "stop":
             with self.lock:
                 self.pomoTimer_state["running"] = False
             
-        elif action == "set":
+        elif action == "reset":
             with self.lock:
                 self.pomoTimer_state = {
                     "running": False, 
@@ -174,34 +171,13 @@ class PlatformServer:
         # Broadcast timer state to all clients
         self._broadcast_tcp_message({
             "type": "timer_update",
-            "timer_state": self._iso_timer()
+            "timer_state": self.pomoTimer_state
         })
-        publish("timer_updates",{
-            "type": "timer_update",
-            "timer_state": self._iso_timer()
-        })
-
-    # Turn timer into ISO timestamp
-    def _iso_timer(self):
-        state = self.pomoTimer_state.copy()
-        start_time = state.get("start_time")
-
-        if isinstance(start_time, datetime):
-            state["start_time"] = start_time.isoformat()
-
-        if state["running"] and start_time:
-            elapsed = (datetime.now(timezone.utc) - self.pomoTimer_state["start_time"]).total_seconds()
-            remaining = state["duration"] - elapsed
-            state["remaining_time"] = max(0, remaining)
-        else:
-            state["remaining_time"] = state["duration"]
-
-        return state
-
+        
     # Broadcast TCP messages to clients (users)
     def _broadcast_tcp_message(self, message):
         
-        message_json = json.dumps(message, default=str)
+        message_json = json.dumps(message)
         disconnected_clients = []
         
         with self.lock:
@@ -216,8 +192,6 @@ class PlatformServer:
             
             for client in disconnected_clients:
                 self.connected_clients.remove(client)
-
-        publish("platform_events", message)
     
     # Broadcast UDP messages to clients (users)
     def _broadcast_udp_message(self, message, udp_socket):
@@ -260,12 +234,6 @@ class PlatformServer:
             "event": event,
             "all_events": self.calendar_events
         })
-
-        publish("calendar_events", {
-            "type": "calendar_update",
-            "event": event,
-            "all_events": self.calendar_events
-        })
     
     # Handling goal events (CRUD)
     def _handle_goal_update(self, message):
@@ -276,43 +244,34 @@ class PlatformServer:
             "user": message.get("user"),
             "completed": message.get("completed", False)
         })
-
-        publish("goal_updates",{
-            "type": "goal_update",
-            "goal": message.get("goal"),
-            "user": message.get("user"),
-            "completed": message.get("completed", False)
-        })
     
     # Timer updates
     def _manage_timer(self):
+        
         while True:
             with self.lock:
-                if self.pomoTimer_state["running"] and self.pomoTimer_state["start_time"]:
-                    state = self._iso_timer()
-                    remaining = state["remaining_time"]
-
+                if self.pomoTimer_state["running"]:
+                    
+                    elapsed = time.time() - self.pomoTimer_state["start_time"]
+                    remaining = max(0, self.pomoTimer_state["duration"] - elapsed)
+                    
                     # Broadcast timer update every second
                     self._broadcast_tcp_message({
                         "type": "timer_tick",
-                        "timer_state": state
+                        "remaining_time": remaining,
+                        "timer_state": self.pomoTimer_state
                     })
-                    publish("timer_updates", {
-                        "type":"timer_tick",
-                        "timer_state": state
-                    })
-
+                    
                     # Check if timer completed
                     if remaining <= 0:
+                        
                         self.pomoTimer_state["running"] = False
+                        
                         self._broadcast_tcp_message({
                             "type": "timer_complete",
-                            "timer_state": state
+                            "timer_state": self.pomoTimer_state
                         })
-                        publish("timer_updates",{
-                            "type": "timer_complete",
-                            "timer_state": state
-                        })
+            
             time.sleep(1)
 
     def _stop_server(self):
