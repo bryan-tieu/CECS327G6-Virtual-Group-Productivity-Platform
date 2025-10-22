@@ -112,10 +112,7 @@ sudo systemctl start redis-server
 ### 3. Run the Complete System
 
 ```bash
-# Terminal 1 - Start the core platform server
-python server.py
-
-# Terminal 2 - Start the FastAPI server
+# Start the FastAPI server
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
