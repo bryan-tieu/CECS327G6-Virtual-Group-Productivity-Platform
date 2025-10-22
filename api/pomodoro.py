@@ -43,20 +43,6 @@ def start_pomo():
             "action": "start",
             "timestamp": datetime.now(timezone.utc).isoformat()}
 
-@router.post("/stop")
-def stop_pomo():
-    socket_server._handle_timer_control({"action": "stop"})
-    publish("timer_controls", {
-        "type": "timer_control",
-        "action": "stop",
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    })
-    return {"status": "stopped",
-            "type": "timer_control",
-            "action": "stop",
-            "timestamp": datetime.now(timezone.utc).isoformat()
-            }
-
 @router.post("/set")
 def set_pomo(duration_minutes: int=25):
     socket_server._handle_timer_control({

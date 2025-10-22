@@ -159,10 +159,6 @@ class PlatformServer:
                 self.pomoTimer_state["running"] = True
                 self.pomoTimer_state["start_time"] = datetime.now(timezone.utc)
             
-        elif action == "stop":
-            with self.lock:
-                self.pomoTimer_state["running"] = False
-            
         elif action == "set":
             with self.lock:
                 self.pomoTimer_state = {
