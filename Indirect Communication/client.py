@@ -54,7 +54,7 @@ class PlatformClient:
         msg_type = msg.get("type")
 
         if msg_type == "timer_update":
-            print(f"[Server] Timer State Updated: {msg["timer_state"]}")
+            print(f"[Server] Timer State Updated: {msg['timer_state']}")
 
         elif msg_type == "timer_tick":
             if not self.active_input:
@@ -80,22 +80,68 @@ class PlatformClient:
 
     #Commands
     def start_timer(self):
-        self.send_tcp_message({
-            "type": "timer_control",
-            "action": "start"
-        })
+        # this should start a timer locally and designate this process as the master clock for it
+        # each client should only have one timer running at any given time.
+        # if we are already synced to another timer, call stop_timer first
+        # spin up a thread that runs manage_timer
+        pass
+
+
+    def join_timer(self, address):
+        # this should ask an existing process to join its timer
+        # that process should respond either:
+        #   with a confirmation of availability, and we designate them as our syncing master
+        #   with the address of one of its children, which we recursively call join_timer on
+        # (not every node needs to know who the master clock is)
+        # start a local timer and sync it to the global one
+        # if we are currently running a local timer, call stop_timer
+        # spin up a thread that runs manage_timer
+        pass
+
+
 
     def stop_timer(self):
-        self.send_tcp_message({
-            "type": "timer_control",
-            "action": "stop"
-        })
+        # this should:
+        #   if this process is the master clock, stop the timer (either designate another as master clock or
+        #   tell all synced timers to stop, depends on how we want to implement it)
+
+        #   if this process is not the master clock, stop syncing operations and our local instance
+        pass
 
     def reset_timer(self):
-        self.send_tcp_message({
-        "type": "timer_control",
-        "action": "reset",
-    })
+        # this should:
+        #   if this process is the master clock, restart the local timer
+        #   if this process is not the master clock, submit a request to our syncing master to restart its timer,
+        #   which it will pass to its syncing master until it gets to the master clock
+
+        # I'm thinking we could have an option for the master clock that determines whether
+        # it will listen to that request or not
+        pass
+
+    def request_sync(self):
+        # this should ask our syncing master for an update
+        # have this be called periodically instead of at user request
+
+        # this is also where we do failure detection and handling
+        #   suspect syncing master of crashing if there's not a response for a while
+        #   maintain knowledge of syncing master's master (syncing grandmaster) if it exists
+        #   if master is suspected, ask grandmaster for permission to take up its role
+        #   grandmaster should respond either:
+        #       yes, and recognize us as a new child
+        #       no, and give us the identity of new syncing master
+        #           this would be either the process that replaced the crashed master,
+        #           or a different child (if grandmaster is still in contact with master)
+        pass
+
+    def manage_timer(self):
+        # this should be used by a thread to periodically call request_sync and
+        # to manage any child processes using us as a syncing master
+
+        # if another process tries to join our timer, either add them as a child directly
+        # or tell them to join one of our children (join_timer should be recursive)
+        # this will depend on if we have the maximum number of children already (whatever we decide to set that to)
+        pass
+
 
     def add_calendar_event(self, title, description, time_str):
         event = {
@@ -116,10 +162,7 @@ class PlatformClient:
             "completed": completed
         })
 
-    def request_sync(self):
-        self.send_tcp_message({
-            "type": "request_sync"
-        })
+
 
 
 if __name__ == "__main__":
