@@ -42,14 +42,26 @@ class PlatformClient:
 
     def tcp_listener(self):
         #Wait and listen for message
+        buffer = b""
         while self.running:
             try:
                     data = self.tcp_socket.recv(1024)
                     if not data:
                         break
+                    buffer += data
                     
-                    message = json.loads(data.decode())
-                    self.handle_tcp_message(message)
+                    while b"\n" in buffer:
+                        line, buffer = buffer.split(b"\n", 1)
+                        if not line:
+                            continue
+                        
+                        try:
+                            message = json.loads(line.decode("utf-8"))
+                        except Exception as e:
+                            print(f"[Client] JSON parse error: {e}")
+                            continue
+                        
+                        self.handle_tcp_message(message)
 
             except Exception as e:
                 print(f"[Client] TCP listener error: {e}")
@@ -77,8 +89,8 @@ class PlatformClient:
     #TCP message
     def send_tcp_message(self, msg):
         try:
-            self.tcp_socket.send(json.dumps(msg).encode())
-
+            wire = (json.dumps(msg) + "\n").encode("utf-8")
+            self.tcp_socket.sendall(wire)
         except Exception as e:
             print(f"[Client] Error sending tcp message: {e}")
 
@@ -98,8 +110,7 @@ class PlatformClient:
         # initialize timer
 
         # spin up a thread that runs _manage_timer
-        timer_thread = threading.Thread(target=self._manage_timer())
-        timer_thread.daemon = False
+        timer_thread = threading.Thread(target=self._manage_timer, daemon=True)
         timer_thread.start()
 
 
@@ -277,7 +288,15 @@ if __name__ == "__main__":
         elif option == "0":
             print("Exiting...")
             client.running = False
-            client.tcp_socket.close()
+            try:
+                client.stop_event.set()
+            except:
+                pass
+            
+            try: 
+                client.tcp_socket.close()
+            except:
+                pass
             break
 
         else:
