@@ -3,6 +3,7 @@ import threading
 import json
 import time
 from datetime import datetime
+import threading
 
 class PlatformClient:
 
@@ -15,6 +16,10 @@ class PlatformClient:
         #self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.running = True
         self.active_input = False
+        self.timer_running = False
+        self.sync_master = None
+        self.sync_grandmaster = None
+        self.children = []
 
 
 
@@ -83,8 +88,20 @@ class PlatformClient:
         # this should start a timer locally and designate this process as the master clock for it
         # each client should only have one timer running at any given time.
         # if we are already synced to another timer, call stop_timer first
-        # spin up a thread that runs manage_timer
-        pass
+
+
+        if self.timer_running:
+            self.stop_timer()
+
+        self.sync_master = None # this might end up being redundant
+
+        # initialize timer
+
+        # spin up a thread that runs _manage_timer
+        timer_thread = threading.Thread(target=self._manage_timer())
+        timer_thread.daemon = False
+        timer_thread.start()
+
 
 
     def join_timer(self, address):
@@ -95,8 +112,22 @@ class PlatformClient:
         # (not every node needs to know who the master clock is)
         # start a local timer and sync it to the global one
         # if we are currently running a local timer, call stop_timer
-        # spin up a thread that runs manage_timer
-        pass
+
+        if self.timer_running:
+            self.stop_timer()
+
+        # ask process at address
+        # handle potential non-responsiveness
+
+        #if response == "confirmed":
+        #    self.sync_master = address
+        #else:
+        #    self.join_timer(response)
+
+        # spin up a thread that runs _manage_timer
+        timer_thread = threading.Thread(target=self._manage_timer())
+        timer_thread.daemon = False
+        timer_thread.start()
 
 
 
@@ -105,8 +136,24 @@ class PlatformClient:
         #   if this process is the master clock, stop the timer (either designate another as master clock or
         #   tell all synced timers to stop, depends on how we want to implement it)
 
-        #   if this process is not the master clock, stop syncing operations and our local instance
-        pass
+        #   if this process is not the master clock, end the timer management thread
+
+        if not self.timer_running:  # if there isn't a timer running, do nothing
+            return None
+        elif self.sync_master is None:  # if this is the master clock
+            # do behavior described above
+            pass
+        else:  # if we aren't the master clock and there is a timer running
+            # stop local timer/end management thread
+            pass
+
+
+
+        # state cleanup
+        self.children = []
+        self.sync_master = None
+        self.sync_grandmaster = None
+        self.timer_running = False
 
     def reset_timer(self):
         # this should:
@@ -118,9 +165,8 @@ class PlatformClient:
         # it will listen to that request or not
         pass
 
-    def request_sync(self):
+    def _request_sync(self):
         # this should ask our syncing master for an update
-        # have this be called periodically instead of at user request
 
         # this is also where we do failure detection and handling
         #   suspect syncing master of crashing if there's not a response for a while
@@ -133,14 +179,26 @@ class PlatformClient:
         #           or a different child (if grandmaster is still in contact with master)
         pass
 
-    def manage_timer(self):
-        # this should be used by a thread to periodically call request_sync and
+    def _manage_timer(self):
+        # this should be used by a thread to periodically call _request_sync and
         # to manage any child processes using us as a syncing master
 
         # if another process tries to join our timer, either add them as a child directly
         # or tell them to join one of our children (join_timer should be recursive)
         # this will depend on if we have the maximum number of children already (whatever we decide to set that to)
-        pass
+
+
+        self.timer_running = True
+        while self.timer_running:
+            self._request_sync()
+            # check for sync requests and respond accordingly
+
+            # check for join messages and respond accordingly
+            time.sleep(1)
+
+
+
+
 
 
     def add_calendar_event(self, title, description, time_str):
@@ -177,9 +235,10 @@ if __name__ == "__main__":
         "1. Start Timer\n"
         "2. Stop Timer\n"
         "3. Reset Timer\n"
-        "4. Add Calendar Event\n"
-        "5. Update Goal\n"
-        "6. Request Sync\n"
+        "4. Join Timer\n"
+        "5. Add Calendar Event\n"
+        "6. Update Goal\n"
+        
         "0. Exit\n")
 
         option = input("Select Option: ")
@@ -194,6 +253,10 @@ if __name__ == "__main__":
             client.reset_timer()
 
         elif option == "4":
+            address = input("Enter address: ")
+            client.join_timer(address)
+
+        elif option == "5":
             client.active_input = True
             title = input("Title: ")
             desc = input("Description: ")
@@ -201,7 +264,7 @@ if __name__ == "__main__":
             client.add_calendar_event(title, desc, time_str)
             client.active_input = False
 
-        elif option == "5":
+        elif option == "6":
             client.active_input = True
             user = input("User: ")
             goal = input("Goal: ")
@@ -209,8 +272,7 @@ if __name__ == "__main__":
             client.update_goal(goal, user, finish)
             client.active_input = False
 
-        elif option == "6":
-            client.request_sync()
+
 
         elif option == "0":
             print("Exiting...")
