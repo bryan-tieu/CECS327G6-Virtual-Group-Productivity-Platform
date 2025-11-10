@@ -3,7 +3,9 @@ import threading
 import json
 import time
 from datetime import datetime
-import threading
+
+
+time_until_suspicion = 5
 
 class PlatformClient:
 
@@ -111,6 +113,7 @@ class PlatformClient:
 
         # spin up a thread that runs _manage_timer
         timer_thread = threading.Thread(target=self._manage_timer, daemon=True)
+        timer_thread.daemon = False
         timer_thread.start()
 
 
@@ -143,21 +146,11 @@ class PlatformClient:
 
 
     def stop_timer(self):
-        # this should:
-        #   if this process is the master clock, stop the timer (either designate another as master clock or
-        #   tell all synced timers to stop, depends on how we want to implement it)
 
-        #   if this process is not the master clock, end the timer management thread
-
-        if not self.timer_running:  # if there isn't a timer running, do nothing
-            return None
-        elif self.sync_master is None:  # if this is the master clock
-            # do behavior described above
+        if self.sync_master is None and self.timer_running:  # if this is the master clock
+            # stop the timer (either designate another as master clock or tell all synced timers to stop,
+            # depends on how we want to implement it)
             pass
-        else:  # if we aren't the master clock and there is a timer running
-            # stop local timer/end management thread
-            pass
-
 
 
         # state cleanup
@@ -165,6 +158,9 @@ class PlatformClient:
         self.sync_master = None
         self.sync_grandmaster = None
         self.timer_running = False
+        # even if the management thread persists between two separate timers, it will read the attributes needed
+        # for the new timer and work accordingly
+
 
     def reset_timer(self):
         # this should:
@@ -176,11 +172,10 @@ class PlatformClient:
         # it will listen to that request or not
         pass
 
-    def _request_sync(self):
+    def _request_sync(self, suspected):
         # this should ask our syncing master for an update
 
         # this is also where we do failure detection and handling
-        #   suspect syncing master of crashing if there's not a response for a while
         #   maintain knowledge of syncing master's master (syncing grandmaster) if it exists
         #   if master is suspected, ask grandmaster for permission to take up its role
         #   grandmaster should respond either:
@@ -198,13 +193,21 @@ class PlatformClient:
         # or tell them to join one of our children (join_timer should be recursive)
         # this will depend on if we have the maximum number of children already (whatever we decide to set that to)
 
-
+        crash_suspected = False
         self.timer_running = True
+        last_contact = time.time()
+
         while self.timer_running:
-            self._request_sync()
+            if self.sync_master is not None:  # if we are not master clock
+                # check how long since last contact
+                if time.time() - last_contact > time_until_suspicion:
+                    crash_suspected = True
+                self._request_sync(crash_suspected)
+
             # check for sync requests and respond accordingly
 
             # check for join messages and respond accordingly
+
             time.sleep(1)
 
 
