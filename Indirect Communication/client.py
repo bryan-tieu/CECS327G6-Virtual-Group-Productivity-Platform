@@ -1,4 +1,3 @@
-import queue
 import socket
 import threading
 import json
@@ -31,7 +30,8 @@ class PlatformClient:
         self.last_sync = time.time()  # log of last time a sync was received from master
         self.time_left = 0.0  # float indicating number of seconds until timer finishes
         self.inbox = Queue()  # used to pass messages from the tcp message handler to the timer management thread
-        self.socket_connected = False  # tracks if a connection has been made with either the central server or a peer
+        self.server_connected = False  # tracks if a connection has been made with the central server
+        self.address = 'localhost'  # our own address
 
         # start tcp listener
         tcp_listen_thread = threading.Thread(target=self.tcp_listener)
@@ -56,7 +56,7 @@ class PlatformClient:
 
         else:
             print(f"[Client] Connected to server at {self.host}:{self.tcp_port}")
-            self.socket_connected = True
+            self.server_connected = True
 
 
 
@@ -64,7 +64,7 @@ class PlatformClient:
         #Wait and listen for message
         buffer = b""
         while True:
-             if self.socket_connected: # only executes if server is connected
+             if self.server_connected: # only executes if server is connected
                 try:
                         data = self.tcp_socket.recv(1024)
                         if not data:
@@ -149,10 +149,14 @@ class PlatformClient:
             pass
         elif self.timer_running:  # if this is not the master clock
             # send a message to our parent indicating we are disconnecting
-            pass
+            msg = {"type": "disconnect_notice",
+                    "address": self.address
+                    }
+            self.send_tcp_message(msg, self.sync_master)
 
 
         # state cleanup
+        self.time_left = 0.0
         self.children = []
         self.sync_master = None
         self.sync_grandmaster = None
@@ -210,7 +214,7 @@ class PlatformClient:
                     if msg_type == "confirm_join":
                         self.sync_master = message.get("address")
                         self.sync_grandmaster = message.get("parent_address")
-                        self.socket_connected = True
+                        self.server_connected = True
                         self.timer_running = True
                     elif msg_type == "deny_join":
                         self.join_timer(message.get("address"))
@@ -233,7 +237,7 @@ class PlatformClient:
         self.send_tcp_message({
             "type": "calendar_event",
             "event": event
-        })
+        }, self.host)
 
     def update_goal(self, goal, user, completed=False):
         self.send_tcp_message({
@@ -241,7 +245,7 @@ class PlatformClient:
             "goal": goal,
             "user": user,
             "completed": completed
-        })
+        }, self.host)
 
 
 
@@ -257,10 +261,9 @@ if __name__ == "__main__":
         print("\nCommand Options (Enter number):\n"
         "1. Start Timer\n"
         "2. Stop Timer\n"
-        "3. Reset Timer\n"
-        "4. Join Timer\n"
-        "5. Add Calendar Event\n"
-        "6. Update Goal\n"
+        "3. Join Timer\n"
+        "4. Add Calendar Event\n"
+        "5. Update Goal\n"
         
         "0. Exit\n")
 
@@ -273,13 +276,11 @@ if __name__ == "__main__":
             client.stop_timer()
 
         elif option == "3":
-            client.reset_timer()
-
-        elif option == "4":
             address = input("Enter address: ")
             client.join_timer(address)
 
-        elif option == "5":
+
+        elif option == "4":
             client.active_input = True
             title = input("Title: ")
             desc = input("Description: ")
@@ -287,7 +288,7 @@ if __name__ == "__main__":
             client.add_calendar_event(title, desc, time_str)
             client.active_input = False
 
-        elif option == "6":
+        elif option == "5":
             client.active_input = True
             user = input("User: ")
             goal = input("Goal: ")
