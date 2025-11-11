@@ -4,12 +4,14 @@ import threading
 import json
 import time
 from datetime import datetime
-from queue import Queue
+from queue import Queue, Empty
 
 
 time_until_suspicion = 5
 default_timer_length = 25.0 * 60
 maximum_children = 5
+tick_rate = 0.1
+
 
 class PlatformClient:
 
@@ -30,7 +32,15 @@ class PlatformClient:
         self.time_left = 0.0  # float indicating number of seconds until timer finishes
         self.inbox = Queue()  # used to pass messages from the tcp message handler to the timer management thread
 
+        # start tcp listener
+        tcp_listen_thread = threading.Thread(target=self.tcp_listener)
+        tcp_listen_thread.daemon = True
+        tcp_listen_thread.start()
 
+        # timer management thread
+        timer_thread = threading.Thread(target=self._manage_timer)
+        timer_thread.daemon = True
+        timer_thread.start()
 
     def connect_servers(self):
         #Attempt server connection
@@ -39,10 +49,8 @@ class PlatformClient:
             self.tcp_socket.connect((self.host, self.tcp_port))
             print(f"[Client] Connected to server at {self.host}:{self.tcp_port}")
 
-            #Start Thread
-            tcp_listen_thread = threading.Thread(target=self.tcp_listener)
-            tcp_listen_thread.daemon = True
-            tcp_listen_thread.start()
+
+
 
 
         except Exception as e:
@@ -92,53 +100,40 @@ class PlatformClient:
     def send_tcp_message(self, msg, destination):
         try:
             wire = (json.dumps(msg) + "\n").encode("utf-8")
+            # need to add addressing functionality (send message only to specified destination)
+            # also prevent sending messages to anything other than children/server (except for disconnect_notice type)
+
             self.tcp_socket.sendall(wire)
         except Exception as e:
             print(f"[Client] Error sending tcp message: {e}")
 
 
     #Commands
-    def start_timer(self):
+    def start_timer(self, duration=default_timer_length):
         if self.timer_running:
             self.stop_timer()
 
-        self.sync_master = None # this might end up being redundant
+        self.sync_master = None  # this might end up being redundant
 
         # initialize timer
 
-        self.time_left = default_timer_length
+        self.time_left = duration
+        self.timer_running = True
 
-        # spin up a thread that runs _manage_timer
-        timer_thread = threading.Thread(target=self._manage_timer)
-        timer_thread.daemon = True
-        timer_thread.start()
 
 
 
     def join_timer(self, address):
         # this should ask an existing process to join its timer
-        # that process should respond either:
-        #   with a confirmation of availability, and we designate them as our syncing master
-        #   with the address of one of its children, which we recursively call join_timer on
-        # (not every node needs to know who the master clock is)
-        # start a local timer and sync it to the global one
         # if we are currently running a local timer, call stop_timer
 
         if self.timer_running:
             self.stop_timer()
 
         # ask process at address
-        # handle potential non-responsiveness
+        msg = {"type": "join_request"}
+        self.send_tcp_message(msg, address)
 
-        #if response == "confirmed":
-        #    self.sync_master = address
-        #else:
-        #    self.join_timer(response)
-
-        # spin up a thread that runs _manage_timer
-        timer_thread = threading.Thread(target=self._manage_timer)
-        timer_thread.daemon = True
-        timer_thread.start()
 
 
 
@@ -158,8 +153,6 @@ class PlatformClient:
         self.sync_master = None
         self.sync_grandmaster = None
         self.timer_running = False
-        # even if the management thread persists between two separate timers, it will read the attributes needed
-        # for the new timer and work accordingly
 
 
 
@@ -187,21 +180,40 @@ class PlatformClient:
         # this will depend on if we have the maximum number of children already (whatever we decide to set that to)
 
         crash_suspected = False
-        self.timer_running = True
 
 
-        while self.timer_running:
-            if self.sync_master is not None:  # if we are not master clock
-                # check how long since last contact
-                if time.time() - self.last_sync > time_until_suspicion:
-                    crash_suspected = True
-                self._request_sync(crash_suspected)
+        while True:
+            if self.timer_running:  # prevents thread from using resources if no timer is active
+                if self.sync_master is not None:  # if we are not master clock
+                    # check how long since last contact
+                    if time.time() - self.last_sync > time_until_suspicion:
+                        crash_suspected = True
+                    self._request_sync(crash_suspected)
 
-            # check for sync requests and respond accordingly
+                # check for sync requests and respond accordingly
 
-            # check for join messages and respond accordingly
+                # check for join messages and respond accordingly
+            else:  # used for joining timers
+                cont = True
+                while cont:
+                    # retrieve message from inbox until none are left
+                    try:
+                        message = self.inbox.get()
+                    except Empty:
+                        cont = False
+                        break
 
-            time.sleep(1)
+                    msg_type = message.get("type")
+                    if msg_type == "confirm_join":
+                        self.sync_master = message.get("address")
+                        self.sync_grandmaster = message.get("parent_address")
+                        self.timer_running = True
+                    elif msg_type == "deny_join":
+                        self.join_timer(message.get("address"))
+                    # all unrelated messages are discarded
+
+
+            time.sleep(tick_rate)
 
 
 
