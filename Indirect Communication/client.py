@@ -1,11 +1,15 @@
+import queue
 import socket
 import threading
 import json
 import time
 from datetime import datetime
+from queue import Queue
 
 
 time_until_suspicion = 5
+default_timer_length = 25.0 * 60
+maximum_children = 5
 
 class PlatformClient:
 
@@ -22,6 +26,9 @@ class PlatformClient:
         self.sync_master = None
         self.sync_grandmaster = None
         self.children = []
+        self.last_sync = time.time()  # log of last time a sync was received from master
+        self.time_left = 0.0  # float indicating number of seconds until timer finishes
+        self.inbox = Queue()  # used to pass messages from the tcp message handler to the timer management thread
 
 
 
@@ -72,24 +79,17 @@ class PlatformClient:
     def handle_tcp_message(self, msg):
         msg_type = msg.get("type")
 
+
         if msg_type == "timer_update":
-            print(f"[Server] Timer State Updated: {msg['timer_state']}")
-
-        elif msg_type == "timer_tick":
-            if not self.active_input:
-                mins, secs = divmod(int(msg["remaining_time"]), 60)
-                print(f"\r[Timer] Remaining: {mins:02d}:{secs:02d}   ", end="", flush=True)
-
-        elif msg_type == "timer_complete":
-            print("[Timer] Pomodoro session complete")
+            # save current time for syncing/failure detection
+            self.last_sync = time.time()
 
 
-        else:
-            print(f"[Server] Message: {msg}")
+        self.inbox.put(msg)
 
     
     #TCP message
-    def send_tcp_message(self, msg):
+    def send_tcp_message(self, msg, destination):
         try:
             wire = (json.dumps(msg) + "\n").encode("utf-8")
             self.tcp_socket.sendall(wire)
@@ -99,11 +99,6 @@ class PlatformClient:
 
     #Commands
     def start_timer(self):
-        # this should start a timer locally and designate this process as the master clock for it
-        # each client should only have one timer running at any given time.
-        # if we are already synced to another timer, call stop_timer first
-
-
         if self.timer_running:
             self.stop_timer()
 
@@ -111,9 +106,11 @@ class PlatformClient:
 
         # initialize timer
 
+        self.time_left = default_timer_length
+
         # spin up a thread that runs _manage_timer
-        timer_thread = threading.Thread(target=self._manage_timer, daemon=True)
-        timer_thread.daemon = False
+        timer_thread = threading.Thread(target=self._manage_timer)
+        timer_thread.daemon = True
         timer_thread.start()
 
 
@@ -139,8 +136,8 @@ class PlatformClient:
         #    self.join_timer(response)
 
         # spin up a thread that runs _manage_timer
-        timer_thread = threading.Thread(target=self._manage_timer())
-        timer_thread.daemon = False
+        timer_thread = threading.Thread(target=self._manage_timer)
+        timer_thread.daemon = True
         timer_thread.start()
 
 
@@ -150,6 +147,9 @@ class PlatformClient:
         if self.sync_master is None and self.timer_running:  # if this is the master clock
             # stop the timer (either designate another as master clock or tell all synced timers to stop,
             # depends on how we want to implement it)
+            pass
+        elif self.timer_running:  # if this is not the master clock
+            # send a message to our parent indicating we are disconnecting
             pass
 
 
@@ -162,20 +162,13 @@ class PlatformClient:
         # for the new timer and work accordingly
 
 
-    def reset_timer(self):
-        # this should:
-        #   if this process is the master clock, restart the local timer
-        #   if this process is not the master clock, submit a request to our syncing master to restart its timer,
-        #   which it will pass to its syncing master until it gets to the master clock
 
-        # I'm thinking we could have an option for the master clock that determines whether
-        # it will listen to that request or not
-        pass
 
+    #Timer functions
     def _request_sync(self, suspected):
         # this should ask our syncing master for an update
 
-        # this is also where we do failure detection and handling
+        # this is also where we do failure handling
         #   maintain knowledge of syncing master's master (syncing grandmaster) if it exists
         #   if master is suspected, ask grandmaster for permission to take up its role
         #   grandmaster should respond either:
@@ -195,12 +188,12 @@ class PlatformClient:
 
         crash_suspected = False
         self.timer_running = True
-        last_contact = time.time()
+
 
         while self.timer_running:
             if self.sync_master is not None:  # if we are not master clock
                 # check how long since last contact
-                if time.time() - last_contact > time_until_suspicion:
+                if time.time() - self.last_sync > time_until_suspicion:
                     crash_suspected = True
                 self._request_sync(crash_suspected)
 
