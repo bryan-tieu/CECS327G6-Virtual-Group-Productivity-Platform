@@ -2,6 +2,7 @@ import socket
 import threading
 import json
 import time
+import math
 from datetime import datetime
 from queue import Queue, Empty
 
@@ -27,6 +28,7 @@ class PlatformClient:
         self.sync_master = None
         self.sync_grandmaster = None
         self.children = []
+        self.children_lock = threading.Lock()
         self.last_sync = time.time()  # log of last time a sync was received from master
         self.time_left = 0.0  # float indicating number of seconds until timer finishes
         self.inbox = Queue()  # used to pass messages from the tcp message handler to the timer management thread
@@ -64,7 +66,7 @@ class PlatformClient:
         #Wait and listen for message
         buffer = b""
         while True:
-             if self.server_connected: # only executes if server is connected
+             if self.server_connected or self.timer_running:  # only executes if server is connected or timer is active
                 try:
                         data = self.tcp_socket.recv(1024)
                         if not data:
@@ -88,6 +90,8 @@ class PlatformClient:
                     print(f"[Client] TCP listener error: {e}")
 
 
+
+
     def handle_tcp_message(self, msg):
         msg_type = msg.get("type")
 
@@ -106,8 +110,9 @@ class PlatformClient:
             wire = (json.dumps(msg) + "\n").encode("utf-8")
             # need to add addressing functionality (send message only to specified destination)
             # also prevent sending messages to anything other than children/server (except for disconnect_notice type)
+            sock =
 
-            self.tcp_socket.sendall(wire)
+            sock.sendall(wire)
         except Exception as e:
             print(f"[Client] Error sending tcp message: {e}")
 
@@ -144,14 +149,18 @@ class PlatformClient:
     def stop_timer(self):
 
         if self.sync_master is None and self.timer_running:  # if this is the master clock
-            # stop the timer (either designate another as master clock or tell all synced timers to stop,
-            # depends on how we want to implement it)
-            pass
+            # designate another as master clock
+
+            self._promotion()
+
+
+
+
+
         elif self.timer_running:  # if this is not the master clock
             # send a message to our parent indicating we are disconnecting
             msg = {"type": "disconnect_notice",
-                    "address": self.address
-                    }
+                    "address": self.address}
             self.send_tcp_message(msg, self.sync_master)
 
 
@@ -223,6 +232,27 @@ class PlatformClient:
 
             time.sleep(tick_rate)
 
+
+    def _promotion(self):
+        # sends a promotion signal to the child with the least load
+        n = math.inf
+        with self.children_lock:
+            if self.children:  # if we have children
+                for child, lineage in self.children:  # search through children and find the one with the smallest lineage
+                    n = min(n, lineage)
+                    if n == lineage:
+                        selected = child
+                self.children.remove((selected, n))
+
+
+                msg = {"type": "promotion",
+                       "children": self.children}
+                self.send_tcp_message(msg, selected)
+
+                msg = {"type": "update_parent",
+                       "address": selected}
+                for child, lineage in self.children:  # for all other children
+                    self.send_tcp_message(msg, child)
 
 
 
