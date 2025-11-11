@@ -31,6 +31,7 @@ class PlatformClient:
         self.last_sync = time.time()  # log of last time a sync was received from master
         self.time_left = 0.0  # float indicating number of seconds until timer finishes
         self.inbox = Queue()  # used to pass messages from the tcp message handler to the timer management thread
+        self.socket_connected = False  # tracks if a connection has been made with either the central server or a peer
 
         # start tcp listener
         tcp_listen_thread = threading.Thread(target=self.tcp_listener)
@@ -47,41 +48,44 @@ class PlatformClient:
         try:
             print("Attempting TCP server connection...")
             self.tcp_socket.connect((self.host, self.tcp_port))
-            print(f"[Client] Connected to server at {self.host}:{self.tcp_port}")
-
-
 
 
 
         except Exception as e:
             print(f"[Client] Connection failed: {e}")
 
+        else:
+            print(f"[Client] Connected to server at {self.host}:{self.tcp_port}")
+            self.socket_connected = True
+
+
 
     def tcp_listener(self):
         #Wait and listen for message
         buffer = b""
-        while self.running:
-            try:
-                    data = self.tcp_socket.recv(1024)
-                    if not data:
-                        break
-                    buffer += data
-                    
-                    while b"\n" in buffer:
-                        line, buffer = buffer.split(b"\n", 1)
-                        if not line:
-                            continue
-                        
-                        try:
-                            message = json.loads(line.decode("utf-8"))
-                        except Exception as e:
-                            print(f"[Client] JSON parse error: {e}")
-                            continue
-                        
-                        self.handle_tcp_message(message)
+        while True:
+             if self.socket_connected: # only executes if server is connected
+                try:
+                        data = self.tcp_socket.recv(1024)
+                        if not data:
+                            break
+                        buffer += data
 
-            except Exception as e:
-                print(f"[Client] TCP listener error: {e}")
+                        while b"\n" in buffer:
+                            line, buffer = buffer.split(b"\n", 1)
+                            if not line:
+                                continue
+
+                            try:
+                                message = json.loads(line.decode("utf-8"))
+                            except Exception as e:
+                                print(f"[Client] JSON parse error: {e}")
+                                continue
+
+                            self.handle_tcp_message(message)
+
+                except Exception as e:
+                    print(f"[Client] TCP listener error: {e}")
 
 
     def handle_tcp_message(self, msg):
@@ -158,17 +162,10 @@ class PlatformClient:
 
 
     #Timer functions
-    def _request_sync(self, suspected):
+    def _request_sync(self):
         # this should ask our syncing master for an update
 
-        # this is also where we do failure handling
-        #   maintain knowledge of syncing master's master (syncing grandmaster) if it exists
-        #   if master is suspected, ask grandmaster for permission to take up its role
-        #   grandmaster should respond either:
-        #       yes, and recognize us as a new child
-        #       no, and give us the identity of new syncing master
-        #           this would be either the process that replaced the crashed master,
-        #           or a different child (if grandmaster is still in contact with master)
+
         pass
 
     def _manage_timer(self):
@@ -188,7 +185,13 @@ class PlatformClient:
                     # check how long since last contact
                     if time.time() - self.last_sync > time_until_suspicion:
                         crash_suspected = True
-                    self._request_sync(crash_suspected)
+                    self._request_sync()
+
+                # this is also where we do failure handling
+                #   if master is suspected, ask grandmaster for permission to take up its role
+                #   grandmaster should respond with a update_parent, with the identity of the parent depending on
+                #   whether it still has contact with the suspected process
+
 
                 # check for sync requests and respond accordingly
 
@@ -207,6 +210,7 @@ class PlatformClient:
                     if msg_type == "confirm_join":
                         self.sync_master = message.get("address")
                         self.sync_grandmaster = message.get("parent_address")
+                        self.socket_connected = True
                         self.timer_running = True
                     elif msg_type == "deny_join":
                         self.join_timer(message.get("address"))
