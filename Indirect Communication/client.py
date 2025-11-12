@@ -310,6 +310,17 @@ class PlatformClient:
                             print(f"Synced timer became unresponsive, unable to relink with network: {e}")
                         self.send_tcp_message({"type": "suspect_crash", "address": self.host}, temp)
 
+                # monitor children for failure, and disconnect if suspected
+                with self.children_lock:
+                    for child in self.children:
+                        if child[3] > time_until_suspicion * 2:  # this is very lenient due to grandparents also monitoring children
+                            msg = {"type": "disconnect_notice",
+                                   "address": self.host}
+                            self.send_tcp_message(msg, child[2])
+                            child[2].close()
+                            self.children.remove(child)
+
+
                 # check for messages and respond accordingly
                 while True:
                     try:
@@ -358,8 +369,6 @@ class PlatformClient:
                                         child[2].close()
                                         self.children.remove(child)
                                         break
-
-
 
                     elif msg_type == "promotion":
                         self._promotion()
