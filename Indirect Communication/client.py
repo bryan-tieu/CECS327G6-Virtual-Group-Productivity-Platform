@@ -227,6 +227,8 @@ class PlatformClient:
         # state cleanup
         self.time_left = 0.0
         with self.children_lock:
+            for child in self.children:
+                child[2].close()
             self.children = []
         self.sync_master = None
         self.sync_master_address = None
@@ -293,6 +295,14 @@ class PlatformClient:
                         self.start_timer(self.time_left)
                         continue
                     else:
+                        # inform master that we are disconnecting
+                        msg = {"type": "disconnect_notice",
+                               "address": self.host}
+                        self.send_tcp_message(msg, self.sync_master)
+                        self.sync_master.close()
+                        self.sync_master_address = None
+
+                        # ask grandmaster for guidance
                         temp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                         try:
                             temp.connect((self.sync_grandmaster, self.p2p_port))
@@ -338,7 +348,18 @@ class PlatformClient:
                         self.join_timer(message.get("address"), seamless=True)
 
                     elif msg_type == "disconnect_notice":
-                        pass
+                        sender = message.get("address")
+                        if sender == self.sync_master_address:  # if our sync master disconnected, attempt to rejoin
+                            self.join_timer(self.sync_master_address, seamless=True)
+                        else:  # check if it was one of our children
+                            with self.children_lock:
+                                for child in self.children:
+                                    if sender == child[0]:
+                                        child[2].close()
+                                        self.children.remove(child)
+                                        break
+
+
 
                     elif msg_type == "promotion":
                         self._promotion()
@@ -356,6 +377,7 @@ class PlatformClient:
                         message = self.inbox.get(block=False, timeout=tick_rate)
 
                     except Empty:
+                        # if we are attempting to join and wating on a response
                         if time.time() - self.last_sync > time_until_suspicion and self.sync_master is not None:
                             print("Server took too long to respond, closing connection")
                             self.sync_master.close()
@@ -376,7 +398,6 @@ class PlatformClient:
                     # all unrelated messages are discarded
 
             time.sleep(max(0, tick_rate - (time.time() - start_time)))
-
 
     def _promotion(self):
         # sends a promotion signal to the child with the least load
@@ -402,8 +423,7 @@ class PlatformClient:
                 for child in self.children:  # for all other children
                     self.send_tcp_message(msg, child[2])
 
-
-    def _handle_applicant(self):
+    def _handle_applicants(self):
         message_list = []
         while True: # pulls all messages out of queue
             try:
