@@ -8,7 +8,7 @@ from queue import Queue, Empty
 
 time_until_suspicion = 5
 default_timer_length = 25.0 * 60
-maximum_children = 5
+maximum_children = 3
 tick_rate = 0.1
 
 
@@ -27,7 +27,9 @@ class PlatformClient:
         self.sync_master = None
         self.sync_master_address = None
         self.sync_grandmaster = None
-        self.children = []
+        self.children = []  # 2D array
+        # each entry represents another client that is synced to our timer
+        # format: [address, lineage, socket, crash suspicion]
         self.applicants = Queue()
         self.children_lock = threading.Lock()
         self.last_sync = time.time()  # log of last time a sync was received from master
@@ -70,7 +72,10 @@ class PlatformClient:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp_socket:
             tcp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             tcp_socket.bind((self.host, self.p2p_port))
-            tcp_socket.listen(maximum_children * 2)
+            tcp_socket.listen(maximum_children ** 2)  # this accounts for join applicants and suspecting grandchildren
+            # sockets will only be rejected if either:
+            #   too many applicants ask to join at the same time
+            #   all children crash simultaneously and there is at least one join applicant
 
             print(f"TCP server listening on {self.host}:{self.p2p_port}")
 
@@ -107,9 +112,9 @@ class PlatformClient:
         finally:
 
             with self.children_lock:
-                for child, lineage, sock in self.children:
-                    if child == address:
-                        self.children.remove((child, lineage, sock))
+                for child in self.children:
+                    if child[0] == address:
+                        self.children.remove(child)
                     break
 
             client_socket.close()
@@ -249,6 +254,7 @@ class PlatformClient:
 
         crash_suspected = False
         last_tick = None
+        response_timer = 0
 
         while True:
             start_time = time.time()
@@ -257,6 +263,8 @@ class PlatformClient:
                 current = time.time()
                 if last_tick is not None:  # if the timer didn't just start
                     self.time_left -= current - last_tick
+                    if crash_suspected:
+                        response_timer += current - last_tick
                 last_tick = time.time()
                 if self.time_left <= 0:
                     print("Timer finished")
@@ -275,7 +283,23 @@ class PlatformClient:
                 #   whether it still has contact with the suspected process
 
                 if crash_suspected:
-                    pass
+                    if response_timer > 0: # if we're already waiting on a response from grandmaster
+                        if response_timer > time_until_suspicion:  # if we now suspect grandmaster as having crashed as well
+                            self.sync_grandmaster = None  # see below
+                    elif self.sync_grandmaster is None:  # if the master clock goes out or grandmaster crashes, assume its responsibility to lineage
+                        print("Synced timer unresponsive, reverting to local timer.")
+                        self.start_timer(self.time_left)
+                        continue
+                    else:
+                        temp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        try:
+                            temp.connect((self.sync_grandmaster, self.p2p_port))
+                        except Exception as e:
+                            print(f"Synced timer became unresponsive, unable to relink with network: {e}")
+                        self.send_tcp_message({"type": "suspect_crash", "address": self.host}, temp)
+
+
+
 
                 # check for sync requests and respond accordingly
 
@@ -298,13 +322,15 @@ class PlatformClient:
                                     break
                         if selected is not None:
                             reply = {"type": "sync_update",
-                                     "time": self.time_left}
+                                     "time": self.time_left,
+                                     "grandparent": self.sync_grandmaster}
                             self.send_tcp_message(reply, selected)
 
                     elif msg_type == "sync_update":
                         received = time.time()
                         try:
                             self.time_left = (received - self.last_requested)/2  # uses Cristian's Method for syncing
+                            self.sync_grandmaster = message.get("grandparent")
                         except TypeError:
                             print("Syncing error: Update was received without being requested")
 
@@ -318,7 +344,7 @@ class PlatformClient:
                             reply = {"type": "confirm_join",
                                      "parent_address": self.sync_master_address}
                             with self.children_lock:
-                                self.children.append((applicant[0], 0, applicant[1]))
+                                self.children.append([applicant[0], 0, applicant[1], False])
 
                         else:
                             n = math.inf
@@ -333,8 +359,20 @@ class PlatformClient:
                         self.send_tcp_message(reply, applicant[1])
 
                     elif msg_type == "suspect_crash":
+                        suspect = message.get("suspect")
+                        with self.children_lock:
+                            for child in self.children:
+                                if child[0] == suspect:
+                                    child[3] = True
+                                    break
+
+                    elif msg_type == "update_parent":
+                        self.join_timer(message.get("address"))
+
+                    elif msg_type == "disconnect_notice":
                         pass
-                    elif msg_type == "":
+
+                    elif msg_type == "promotion":
                         pass
 
 
@@ -374,15 +412,15 @@ class PlatformClient:
         with self.children_lock:
             if self.children:  # if we have children
                 new_children = []  # list of children to be given to successor
-                for child, lineage, sock in self.children:  # search through children and find the one with the smallest lineage
-                    new_children.append((child, lineage))
-                    n = min(n, lineage)
-                    if n == lineage:
+                for child in self.children:  # search through children and find the one with the smallest lineage
+                    new_children.append((child[0], child[1]))
+                    n = min(n, child[1])
+                    if n == child[1]:
                         selected = child
-                        s = sock
+                        s = child[2]
 
                 new_children.remove((selected, n))
-                self.children.remove((selected, n, s))
+                self.children.remove(child)
 
                 msg = {"type": "promotion",
                        "children": new_children}
@@ -390,8 +428,8 @@ class PlatformClient:
 
                 msg = {"type": "update_parent",
                        "address": selected}
-                for child, lin, sock in self.children:  # for all other children
-                    self.send_tcp_message(msg, sock)
+                for child in self.children:  # for all other children
+                    self.send_tcp_message(msg, child[2])
 
 
 
