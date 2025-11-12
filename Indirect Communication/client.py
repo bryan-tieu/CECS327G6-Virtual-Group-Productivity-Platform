@@ -15,7 +15,7 @@ tick_rate = 0.1
 class PlatformClient:
 
     # Init
-    def __init__(self, server='localhost', server_port=8000, host='localhost', p2p_port=8001):
+    def __init__(self, server='localhost', server_port=8000, host='127.0.0.1', p2p_port=8001):
         self.host = host
         self.server = server
         self.server_port = server_port
@@ -103,8 +103,7 @@ class PlatformClient:
 
                 message = json.loads(data.decode())
                 print(f"Message received from {address}: {message}")
-                with self.inbox.mutex:
-                    self.inbox.put(message)
+                self.inbox.put(message)
 
         except (ConnectionResetError, json.JSONDecodeError):
             print(f"TCP Client {address} disconnected")
@@ -172,6 +171,7 @@ class PlatformClient:
             # also prevent sending messages to anything other than children/server (except for disconnect_notice type)
 
             sock.sendall(wire)
+            print(f"Sent message {msg} to {sock}")
         except Exception as e:
             print(f"[Client] Error sending tcp message: {e}")
 
@@ -323,7 +323,6 @@ class PlatformClient:
                 while True:
                     try:
                         message = self.inbox.get(block=False, timeout=tick_rate)
-                        print(message)
                     except Empty:
                         break
 
@@ -351,7 +350,7 @@ class PlatformClient:
                             print("Syncing error: Update was received without being requested")
 
                     elif msg_type == "join_request" or msg_type == "suspect_crash":
-                        self._handle_applicants()
+                        self._handle_applicants(message)
 
                     elif msg_type == "update_parent":
                         self.join_timer(message.get("address"), seamless=True)
@@ -382,7 +381,7 @@ class PlatformClient:
                     # retrieve message from inbox until none are left
                     try:
                         message = self.inbox.get(block=False, timeout=tick_rate)
-
+                        print(f"Reply: {message}")
                     except Empty:
                         # if we are attempting to join and wating on a response
                         if time.time() - self.last_sync > time_until_suspicion and self.sync_master is not None:
@@ -419,7 +418,8 @@ class PlatformClient:
                         selected = child
                         s = child[2]
 
-                new_children.remove((selected, n))
+                if new_children:
+                    new_children.remove((selected, n))
                 self.children.remove(child)
 
                 msg = {"type": "promotion"}
@@ -430,11 +430,12 @@ class PlatformClient:
                 for child in self.children:  # for all other children
                     self.send_tcp_message(msg, child[2])
 
-    def _handle_applicants(self):
-        message_list = []
+    def _handle_applicants(self, initial):
+        message_list = [initial]
         while True:  # pulls all messages out of queue
             try:
-                message_list.append(self.inbox.get())
+                n = self.inbox.get(block=False)
+                message_list.append(n)
             except Empty:
                 break
 
@@ -448,7 +449,7 @@ class PlatformClient:
                 applicant = self.applicants.get()
                 for message in message_list:
                     sender = message.get("address")
-                    if applicant[0] == sender:
+                    if applicant[0][0] == sender:
                         if message.get("type") == "suspect_crash":
                             self._suspected_crash(message, applicant)
                         elif message.get("type") == "join_request":
@@ -494,7 +495,7 @@ class PlatformClient:
             reply = {"type": "confirm_join",
                      "parent_address": self.sync_master_address}
             with self.children_lock:
-                self.children.append([applicant[0], 0, applicant[1], False])
+                self.children.append([applicant[0][0], 0, applicant[1], False])
 
         else:
             reply = {"type": "deny_join",
