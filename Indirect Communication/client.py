@@ -1,4 +1,3 @@
-import queue
 import socket
 import threading
 import json
@@ -15,7 +14,7 @@ tick_rate = 0.1
 
 class PlatformClient:
 
-    #Init
+    # Init
     def __init__(self, server='localhost', server_port=8000, host='localhost', p2p_port=8001):
         self.host = host
         self.server = server
@@ -37,7 +36,6 @@ class PlatformClient:
         self.inbox_lock = threading.Lock()
         self.server_connected = False  # tracks if a connection has been made with the central server
 
-
         # start tcp listener
         tcp_listen_thread = threading.Thread(target=self.tcp_listener)
         tcp_listen_thread.daemon = True
@@ -53,12 +51,10 @@ class PlatformClient:
         tcp_thread.start()
 
     def connect_servers(self):
-        #Attempt server connection
+        # Attempt server connection
         try:
             print("Attempting TCP server connection...")
             self.server_socket.connect((self.server, self.server_port))
-
-
 
         except Exception as e:
             print(f"[Client] Connection failed: {e}")
@@ -104,7 +100,6 @@ class PlatformClient:
                 with self.inbox.mutex:
                     self.inbox.put(message)
 
-
         except (ConnectionResetError, json.JSONDecodeError):
             print(f"TCP Client {address} disconnected")
 
@@ -119,28 +114,28 @@ class PlatformClient:
             client_socket.close()
 
     def tcp_listener(self):
-        #Wait and listen for message from central server
+        # Wait and listen for message from central server
         buffer = b""
         while True:
-             if self.server_connected:  # only executes if server is connected
+            if self.server_connected:  # only executes if server is connected
                 try:
-                        data = self.server_socket.recv(1024)
-                        if not data:
-                            break
-                        buffer += data
+                    data = self.server_socket.recv(1024)
+                    if not data:
+                        break
+                    buffer += data
 
-                        while b"\n" in buffer:
-                            line, buffer = buffer.split(b"\n", 1)
-                            if not line:
-                                continue
+                    while b"\n" in buffer:
+                        line, buffer = buffer.split(b"\n", 1)
+                        if not line:
+                            continue
 
-                            try:
-                                message = json.loads(line.decode("utf-8"))
-                            except Exception as e:
-                                print(f"[Client] JSON parse error: {e}")
-                                continue
+                        try:
+                            message = json.loads(line.decode("utf-8"))
+                        except Exception as e:
+                            print(f"[Client] JSON parse error: {e}")
+                            continue
 
-                            self.handle_server_message(message)
+                        self.handle_server_message(message)
 
                 except Exception as e:
                     print(f"[Client] TCP listener error: {e}")
@@ -159,7 +154,6 @@ class PlatformClient:
 
         elif msg_type == "timer_complete":
             print("[Timer] Pomodoro session complete")
-
 
         else:
             print(f"[Server] Message: {msg}")
@@ -245,9 +239,19 @@ class PlatformClient:
         # this will depend on if we have the maximum number of children already (whatever we decide to set that to)
 
         crash_suspected = False
+        last_tick = None
 
         while True:
             if self.timer_running:  # prevents thread from using resources if no timer is active
+                # update internal timer
+                current = time.time()
+                if last_tick is not None:  # if the timer didn't just start
+                    self.time_left -= current - last_tick
+                last_tick = time.time()
+                if self.time_left <= 0:
+                    print("Timer finished")
+                    self.stop_timer()
+
                 if self.sync_master is not None:  # if we are not master clock
                     # check how long since last contact
                     if time.time() - self.last_sync > time_until_suspicion:
@@ -259,6 +263,9 @@ class PlatformClient:
                 #   if master is suspected, ask grandmaster for permission to take up its role
                 #   grandmaster should respond with a update_parent, with the identity of the parent depending on
                 #   whether it still has contact with the suspected process
+
+                if crash_suspected:
+                    pass
 
                 # check for sync requests and respond accordingly
 
@@ -298,6 +305,10 @@ class PlatformClient:
 
                         self.send_tcp_message(reply, applicant[1])
 
+                    elif msg_type == "suspect_crash":
+                        pass
+
+
 
             else:  # used for joining timers
                 while True:
@@ -322,7 +333,6 @@ class PlatformClient:
 
 
             time.sleep(tick_rate)
-        print("_manage_timer ended (this should never happen)")
 
 
     def _promotion(self):
@@ -441,8 +451,6 @@ if __name__ == "__main__":
                 client.stop_timer()
             except:
                 pass
-            break
-
             break
 
         else:
