@@ -190,12 +190,19 @@ class PlatformClient:
             self.stop_timer()
 
         # ask process at address
-        msg = {"type": "join_request"
-               }
-        temp = self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        temp.connect((address, self.p2p_port))
-        self.send_tcp_message(msg, temp)
-        self.sync_master_address = address
+        msg = {"type": "join_request"}
+        self.sync_master = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        print(f"Attempting to connect to {address} on port {self.p2p_port}")
+        self.last_sync = time.time()
+        try:
+            self.sync_master.connect((address, self.p2p_port))
+        except Exception as e:
+            print(f"[Client] Connection failed: {e}")
+        else:
+            print(f"[Client] Connected to server at {address}:{self.p2p_port}, sending join request")
+            self.send_tcp_message(msg, self.sync_master)
+            self.sync_master_address = address
+
 
     def stop_timer(self):
         if self.sync_master is None and self.timer_running:  # if this is the master clock
@@ -317,6 +324,11 @@ class PlatformClient:
                         message = self.inbox.get(block=False, timeout=tick_rate)
 
                     except Empty:
+                        if time.time() - self.last_sync > time_until_suspicion and self.sync_master is not None:
+                            print("Server took too long to respond, closing connection")
+                            self.sync_master.close()
+                            self.sync_master = None
+                            self.sync_master_address = None
                         break
 
                     msg_type = message.get("type")
