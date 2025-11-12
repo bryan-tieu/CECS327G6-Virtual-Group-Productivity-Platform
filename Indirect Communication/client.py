@@ -1,3 +1,4 @@
+import queue
 import socket
 import threading
 import json
@@ -27,6 +28,7 @@ class PlatformClient:
         self.sync_master = None
         self.sync_grandmaster = None
         self.children = []
+        self.applicants = Queue()
         self.children_lock = threading.Lock()
         self.last_sync = time.time()  # log of last time a sync was received from master
         self.time_left = 0.0  # float indicating number of seconds until timer finishes
@@ -79,8 +81,7 @@ class PlatformClient:
 
                 print(f"TCP Connection established with address: {addr}")
 
-                with self.children_lock:
-                    self.children.append((addr, math.inf, client_socket))
+                self.applicants.put((addr, client_socket))
 
                 t = threading.Thread(target=self._handle_p2p_client, args=(client_socket, addr), daemon=True)
 
@@ -98,8 +99,10 @@ class PlatformClient:
                     break
 
                 message = json.loads(data.decode())
-                with self.inbox_lock:
+                print(f"Message received from {address}: {message}")
+                with self.inbox.mutex:
                     self.inbox.put(message)
+
 
         except (ConnectionResetError, json.JSONDecodeError):
             print(f"TCP Client {address} disconnected")
@@ -113,8 +116,6 @@ class PlatformClient:
                     break
 
             client_socket.close()
-
-
 
     def tcp_listener(self):
         #Wait and listen for message from central server
@@ -142,9 +143,6 @@ class PlatformClient:
 
                 except Exception as e:
                     print(f"[Client] TCP listener error: {e}")
-
-
-
 
     def handle_server_message(self, msg):
         # for handling messages from central server
@@ -201,24 +199,27 @@ class PlatformClient:
             self.stop_timer()
 
         # ask process at address
-        msg = {"type": "join_request"}
-        self.send_tcp_message(msg, address)
+        msg = {"type": "join_request"
+               }
+        temp = self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        temp.connect((address, self.p2p_port))
+
+        self.send_tcp_message(msg, temp)
 
 
 
 
     def stop_timer(self):
-        if self.sync_master is None and self.timer_running:  # if this is not the master clock
-            # send a message to our parent indicating we are disconnecting
-            msg = {"type": "disconnect_notice",
-                    "address": self.host}
-            self.send_tcp_message(msg, self.sync_master)
-
-        elif self.timer_running:  # if this is the master clock
+        if self.sync_master is None and self.timer_running:  # if this is the master clock
             # designate another as master clock
-
             self._promotion()
 
+        elif self.timer_running:  # if this is not the master clock
+            # send a message to our parent indicating we are disconnecting
+            msg = {"type": "disconnect_notice",
+                   "address": self.host}
+            self.send_tcp_message(msg, self.sync_master)
+            self.sync_master.close()
 
 
 
@@ -226,6 +227,7 @@ class PlatformClient:
         # state cleanup
         self.time_left = 0.0
         self.children = []
+
         self.sync_master = None
         self.sync_grandmaster = None
         self.timer_running = False
@@ -236,9 +238,14 @@ class PlatformClient:
     #Timer functions
     def _request_sync(self):
         # this should ask our syncing master for an update
+        lineage = 1
+        with self.children_lock:
+            for child in self.children:
+                lineage += child[1]
 
-
-        pass
+        msg = {"type": "sync_request",
+               "lineage": lineage}
+        self.send_tcp_message(msg, self.sync_master)
 
     def _manage_timer(self):
         # this should be used by a thread to periodically call _request_sync and
@@ -257,7 +264,8 @@ class PlatformClient:
                     # check how long since last contact
                     if time.time() - self.last_sync > time_until_suspicion:
                         crash_suspected = True
-                    self._request_sync()
+                    else:
+                        self._request_sync()
 
                 # this is also where we do failure handling
                 #   if master is suspected, ask grandmaster for permission to take up its role
@@ -267,22 +275,45 @@ class PlatformClient:
 
                 # check for sync requests and respond accordingly
 
-                # check for join messages and respond accordingly
-            else:  # used for joining timers
-                cont = True
-                while cont:
-                    # retrieve message from inbox until none are left
+                # check for join requests and respond accordingly
+                while True:
                     try:
                         message = self.inbox.get()
+                        print(message)
                     except Empty:
-                        cont = False
+                        break
+
+                    msg_type = message.get("type")
+
+                    if msg_type == "sync_request":
+                        pass
+                    elif msg_type == "join_request":
+                        try:
+                            applicant = self.applicants.get()
+                        except Empty:
+                            print(f"Unable to locate applicant in queue")
+                            continue
+
+                        with self.children_lock:
+                            self.children.append((applicant[0], math.inf, applicant[1]))
+
+            else:  # used for joining timers
+                while True:
+                    # retrieve message from inbox until none are left
+                    try:
+                        message = self.inbox.get(block=False, timeout=tick_rate)
+
+                    except Empty:
                         break
 
                     msg_type = message.get("type")
                     if msg_type == "confirm_join":
-                        self.sync_master = message.get("address")
+                        parent = message.get("address")
+
+                        self.sync_master = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        self.sync_master.connect((self.host, self.p2p_port))
+
                         self.sync_grandmaster = message.get("parent_address")
-                        self.server_connected = True
                         self.timer_running = True
                     elif msg_type == "deny_join":
                         self.join_timer(message.get("address"))
@@ -290,6 +321,7 @@ class PlatformClient:
 
 
             time.sleep(tick_rate)
+        print("_manage_timer ended (this should never happen)")
 
 
     def _promotion(self):
