@@ -3,7 +3,6 @@ import threading
 import json
 import time
 import math
-from datetime import datetime
 from queue import Queue, Empty
 
 
@@ -16,12 +15,12 @@ tick_rate = 0.1
 class PlatformClient:
 
     #Init
-    def __init__(self, host='localhost', tcp_port=8000, udp_port = 8001):
+    def __init__(self, server='localhost', server_port=8000, host='localhost', p2p_port=8001):
         self.host = host
-        self.tcp_port = tcp_port
-        #self.udp_port = udp_port
-        self.tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        #self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server = server
+        self.server_port = server_port
+        self.p2p_port = p2p_port
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.running = True
         self.active_input = False
         self.timer_running = False
@@ -32,8 +31,9 @@ class PlatformClient:
         self.last_sync = time.time()  # log of last time a sync was received from master
         self.time_left = 0.0  # float indicating number of seconds until timer finishes
         self.inbox = Queue()  # used to pass messages from the tcp message handler to the timer management thread
+        self.inbox_lock = threading.Lock()
         self.server_connected = False  # tracks if a connection has been made with the central server
-        self.address = 'localhost'  # our own address
+
 
         # start tcp listener
         tcp_listen_thread = threading.Thread(target=self.tcp_listener)
@@ -45,11 +45,15 @@ class PlatformClient:
         timer_thread.daemon = True
         timer_thread.start()
 
+        # start tcp server
+        tcp_thread = threading.Thread(target=self._start_p2p_server, daemon=True)
+        tcp_thread.start()
+
     def connect_servers(self):
         #Attempt server connection
         try:
             print("Attempting TCP server connection...")
-            self.tcp_socket.connect((self.host, self.tcp_port))
+            self.server_socket.connect((self.server, self.server_port))
 
 
 
@@ -57,18 +61,68 @@ class PlatformClient:
             print(f"[Client] Connection failed: {e}")
 
         else:
-            print(f"[Client] Connected to server at {self.host}:{self.tcp_port}")
+            print(f"[Client] Connected to server at {self.server}:{self.server_port}")
             self.server_connected = True
+
+    def _start_p2p_server(self):
+
+        # TCP Socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp_socket:
+            tcp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            tcp_socket.bind((self.host, self.p2p_port))
+            tcp_socket.listen(maximum_children * 2)
+
+            print(f"TCP server listening on {self.host}:{self.p2p_port}")
+
+            while self.running:
+                client_socket, addr = tcp_socket.accept()
+
+                print(f"TCP Connection established with address: {addr}")
+
+                with self.children_lock:
+                    self.children.append((addr, math.inf, client_socket))
+
+                t = threading.Thread(target=self._handle_p2p_client, args=(client_socket, addr), daemon=True)
+
+                t.start()
+
+    def _handle_p2p_client(self, client_socket, address):
+
+        try:
+
+            while True:
+
+                data = client_socket.recv(1024)
+
+                if not data:
+                    break
+
+                message = json.loads(data.decode())
+                with self.inbox_lock:
+                    self.inbox.put(message)
+
+        except (ConnectionResetError, json.JSONDecodeError):
+            print(f"TCP Client {address} disconnected")
+
+        finally:
+
+            with self.children_lock:
+                for child, lineage, sock in self.children:
+                    if child == address:
+                        self.children.remove((child, lineage, sock))
+                    break
+
+            client_socket.close()
 
 
 
     def tcp_listener(self):
-        #Wait and listen for message
+        #Wait and listen for message from central server
         buffer = b""
         while True:
-             if self.server_connected or self.timer_running:  # only executes if server is connected or timer is active
+             if self.server_connected:  # only executes if server is connected
                 try:
-                        data = self.tcp_socket.recv(1024)
+                        data = self.server_socket.recv(1024)
                         if not data:
                             break
                         buffer += data
@@ -84,7 +138,7 @@ class PlatformClient:
                                 print(f"[Client] JSON parse error: {e}")
                                 continue
 
-                            self.handle_tcp_message(message)
+                            self.handle_server_message(message)
 
                 except Exception as e:
                     print(f"[Client] TCP listener error: {e}")
@@ -92,25 +146,32 @@ class PlatformClient:
 
 
 
-    def handle_tcp_message(self, msg):
+    def handle_server_message(self, msg):
+        # for handling messages from central server
         msg_type = msg.get("type")
 
-
         if msg_type == "timer_update":
-            # save current time for syncing/failure detection
-            self.last_sync = time.time()
+            print(f"[Server] Timer State Updated: {msg['timer_state']}")
+
+        elif msg_type == "timer_tick":
+            if not self.active_input:
+                mins, secs = divmod(int(msg["remaining_time"]), 60)
+                print(f"\r[Timer] Remaining: {mins:02d}:{secs:02d}   ", end="", flush=True)
+
+        elif msg_type == "timer_complete":
+            print("[Timer] Pomodoro session complete")
 
 
-        self.inbox.put(msg)
+        else:
+            print(f"[Server] Message: {msg}")
 
     
     #TCP message
-    def send_tcp_message(self, msg, destination):
+    def send_tcp_message(self, msg, sock):
         try:
             wire = (json.dumps(msg) + "\n").encode("utf-8")
             # need to add addressing functionality (send message only to specified destination)
             # also prevent sending messages to anything other than children/server (except for disconnect_notice type)
-            sock =
 
             sock.sendall(wire)
         except Exception as e:
@@ -147,21 +208,19 @@ class PlatformClient:
 
 
     def stop_timer(self):
+        if self.sync_master is None and self.timer_running:  # if this is not the master clock
+            # send a message to our parent indicating we are disconnecting
+            msg = {"type": "disconnect_notice",
+                    "address": self.host}
+            self.send_tcp_message(msg, self.sync_master)
 
-        if self.sync_master is None and self.timer_running:  # if this is the master clock
+        elif self.timer_running:  # if this is the master clock
             # designate another as master clock
 
             self._promotion()
 
 
 
-
-
-        elif self.timer_running:  # if this is not the master clock
-            # send a message to our parent indicating we are disconnecting
-            msg = {"type": "disconnect_notice",
-                    "address": self.address}
-            self.send_tcp_message(msg, self.sync_master)
 
 
         # state cleanup
@@ -238,21 +297,25 @@ class PlatformClient:
         n = math.inf
         with self.children_lock:
             if self.children:  # if we have children
-                for child, lineage in self.children:  # search through children and find the one with the smallest lineage
+                new_children = []  # list of children to be given to successor
+                for child, lineage, sock in self.children:  # search through children and find the one with the smallest lineage
+                    new_children.append((child, lineage))
                     n = min(n, lineage)
                     if n == lineage:
                         selected = child
-                self.children.remove((selected, n))
+                        s = sock
 
+                new_children.remove((selected, n))
+                self.children.remove((selected, n, s))
 
                 msg = {"type": "promotion",
-                       "children": self.children}
-                self.send_tcp_message(msg, selected)
+                       "children": new_children}
+                self.send_tcp_message(msg, s)
 
                 msg = {"type": "update_parent",
                        "address": selected}
-                for child, lineage in self.children:  # for all other children
-                    self.send_tcp_message(msg, child)
+                for child, lin, sock in self.children:  # for all other children
+                    self.send_tcp_message(msg, sock)
 
 
 
@@ -267,7 +330,7 @@ class PlatformClient:
         self.send_tcp_message({
             "type": "calendar_event",
             "event": event
-        }, self.host)
+        }, self.server_socket)
 
     def update_goal(self, goal, user, completed=False):
         self.send_tcp_message({
@@ -275,7 +338,7 @@ class PlatformClient:
             "goal": goal,
             "user": user,
             "completed": completed
-        }, self.host)
+        }, self.server_socket)
 
 
 
@@ -340,6 +403,13 @@ if __name__ == "__main__":
                 client.tcp_socket.close()
             except:
                 pass
+
+            try:
+                client.stop_timer()
+            except:
+                pass
+            break
+
             break
 
         else:
