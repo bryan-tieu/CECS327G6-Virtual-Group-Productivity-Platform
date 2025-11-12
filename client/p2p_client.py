@@ -445,10 +445,11 @@ class P2PClient:
         logger.info(f"Joining P2P timer at {address}")
         
         try:
+            self.last_sync = time.time()
             self.sync_master = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             host, port = address.split(":")
             self.sync_master.connect((host, int(port)))
-            self.last_sync = time.time()
+
             
             msg = {
                 "type": "join_request",
