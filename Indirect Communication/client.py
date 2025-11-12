@@ -211,7 +211,6 @@ class PlatformClient:
             self.send_tcp_message(msg, self.sync_master)
             self.sync_master_address = address
 
-
     def stop_timer(self):
         if self.sync_master is None and self.timer_running:  # if this is the master clock
             # designate another as master clock
@@ -287,7 +286,7 @@ class PlatformClient:
                 #   whether it still has contact with the suspected process
 
                 if crash_suspected:
-                    if response_timer > 0: # if we're already waiting on a response from grandmaster
+                    if response_timer > 0:  # if we're already waiting on a response from grandmaster
                         if response_timer > time_until_suspicion:  # if we now suspect grandmaster as having crashed as well
                             self.sync_grandmaster = None  # see below
                     elif self.sync_grandmaster is None:  # if the master clock goes out or grandmaster crashes, assume its responsibility to lineage
@@ -319,7 +318,6 @@ class PlatformClient:
                             self.send_tcp_message(msg, child[2])
                             child[2].close()
                             self.children.remove(child)
-
 
                 # check for messages and respond accordingly
                 while True:
@@ -434,9 +432,9 @@ class PlatformClient:
 
     def _handle_applicants(self):
         message_list = []
-        while True: # pulls all messages out of queue
+        while True:  # pulls all messages out of queue
             try:
-               message_list.append(self.inbox.get())
+                message_list.append(self.inbox.get())
             except Empty:
                 break
 
@@ -454,7 +452,7 @@ class PlatformClient:
                         if message.get("type") == "suspect_crash":
                             self._suspected_crash(message, applicant)
                         elif message.get("type") == "join_request":
-                            self._join_request(message, applicant)
+                            self._join_request(applicant)
 
                         break
 
@@ -491,7 +489,7 @@ class PlatformClient:
 
         self.send_tcp_message(msg, applicant[1])
 
-    def _join_request(self, message, applicant):
+    def _join_request(self, applicant):
         if len(self.children) < maximum_children:
             reply = {"type": "confirm_join",
                      "parent_address": self.sync_master_address}
@@ -512,6 +510,7 @@ class PlatformClient:
                     selected = child
                     n = child[1]
         return selected
+
     def add_calendar_event(self, title, description, time_str):
         event = {
             "title": title,
@@ -538,9 +537,9 @@ if __name__ == "__main__":
     client = PlatformClient()
     client.connect_servers()
 
-    #Get user input
+    # Get user input
     while True:
-        #time.sleep(1)
+        # time.sleep(1)
 
         print("\nCommand Options (Enter number):\n"
         "1. Start Timer\n"
@@ -563,7 +562,6 @@ if __name__ == "__main__":
             address = input("Enter address: ")
             client.join_timer(address)
 
-
         elif option == "4":
             client.active_input = True
             title = input("Title: ")
@@ -579,8 +577,6 @@ if __name__ == "__main__":
             finish = input("Completed? (y/n): ").lower() == 'y'
             client.update_goal(goal, user, finish)
             client.active_input = False
-
-
 
         elif option == "0":
             print("Exiting...")
@@ -603,5 +599,3 @@ if __name__ == "__main__":
 
         else:
             print("Invalid input...")
-
-
