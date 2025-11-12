@@ -35,6 +35,7 @@ class PlatformClient:
         self.inbox = Queue()  # used to pass messages from the tcp message handler to the timer management thread
         self.inbox_lock = threading.Lock()
         self.server_connected = False  # tracks if a connection has been made with the central server
+        self.last_requested = None  # last time a sync was requested
 
         # start tcp listener
         tcp_listen_thread = threading.Thread(target=self.tcp_listener)
@@ -236,6 +237,7 @@ class PlatformClient:
         msg = {"type": "sync_request",
                "lineage": lineage}
         self.send_tcp_message(msg, self.sync_master)
+        self.last_requested = time.time()
 
     def _manage_timer(self):
         # this should be used by a thread to periodically call _request_sync and
@@ -249,6 +251,7 @@ class PlatformClient:
         last_tick = None
 
         while True:
+            start_time = time.time()
             if self.timer_running:  # prevents thread from using resources if no timer is active
                 # update internal timer
                 current = time.time()
@@ -287,7 +290,24 @@ class PlatformClient:
                     msg_type = message.get("type")
 
                     if msg_type == "sync_request":
-                        pass
+                        requester = message.get("address")
+                        with self.children_lock:
+                            for child in self.children:
+                                if child[0] == requester:
+                                    selected = child[2]
+                                    break
+                        if selected is not None:
+                            reply = {"type": "sync_update",
+                                     "time": self.time_left}
+                            self.send_tcp_message(reply, selected)
+
+                    elif msg_type == "sync_update":
+                        received = time.time()
+                        try:
+                            self.time_left = (received - self.last_requested)/2  # uses Cristian's Method for syncing
+                        except TypeError:
+                            print("Syncing error: Update was received without being requested")
+
                     elif msg_type == "join_request":
                         try:
                             applicant = self.applicants.get()
@@ -313,6 +333,8 @@ class PlatformClient:
                         self.send_tcp_message(reply, applicant[1])
 
                     elif msg_type == "suspect_crash":
+                        pass
+                    elif msg_type == "":
                         pass
 
 
@@ -343,8 +365,7 @@ class PlatformClient:
                         self.join_timer(message.get("address"))
                     # all unrelated messages are discarded
 
-
-            time.sleep(tick_rate)
+            time.sleep(max(0, tick_rate - (time.time() - start_time)))
 
 
     def _promotion(self):
