@@ -29,7 +29,7 @@ class PlatformClient:
         self.sync_grandmaster = None
         self.children = []  # 2D array
         # each entry represents another client that is synced to our timer
-        # format: [address, lineage, socket, crash suspicion]
+        # format: [address, lineage, socket, last_contact]
         self.applicants = Queue()
         self.children_lock = threading.Lock()
         self.last_sync = time.time()  # log of last time a sync was received from master
@@ -188,24 +188,26 @@ class PlatformClient:
         self.time_left = duration
         self.timer_running = True
 
-    def join_timer(self, address):
+    def join_timer(self, address, seamless=False):
         # this should ask an existing process to join its timer
-        # if we are currently running a local timer, call stop_timer
-
-        if self.timer_running:
+        # seamless joins are not visible to the user and are used to switch parents on an existing network
+        if self.timer_running and not seamless:
             self.stop_timer()
 
         # ask process at address
-        msg = {"type": "join_request"}
+        msg = {"type": "join_request",
+               "address": self.host}
         self.sync_master = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        print(f"Attempting to connect to {address} on port {self.p2p_port}")
+        if not seamless:
+            print(f"Attempting to connect to {address} on port {self.p2p_port}")
         self.last_sync = time.time()
         try:
             self.sync_master.connect((address, self.p2p_port))
         except Exception as e:
             print(f"[Client] Connection failed: {e}")
         else:
-            print(f"[Client] Connected to server at {address}:{self.p2p_port}, sending join request")
+            if not seamless:
+                print(f"[Client] Connected to server at {address}:{self.p2p_port}, sending join request")
             self.send_tcp_message(msg, self.sync_master)
             self.sync_master_address = address
 
@@ -279,7 +281,7 @@ class PlatformClient:
 
                 # this is also where we do failure handling
                 #   if master is suspected, ask grandmaster for permission to take up its role
-                #   grandmaster should respond with a update_parent, with the identity of the parent depending on
+                #   grandmaster should respond with an update_parent or a promotion, depending on
                 #   whether it still has contact with the suspected process
 
                 if crash_suspected:
@@ -298,12 +300,7 @@ class PlatformClient:
                             print(f"Synced timer became unresponsive, unable to relink with network: {e}")
                         self.send_tcp_message({"type": "suspect_crash", "address": self.host}, temp)
 
-
-
-
-                # check for sync requests and respond accordingly
-
-                # check for join requests and respond accordingly
+                # check for messages and respond accordingly
                 while True:
                     try:
                         message = self.inbox.get(block=False, timeout=tick_rate)
@@ -334,40 +331,11 @@ class PlatformClient:
                         except TypeError:
                             print("Syncing error: Update was received without being requested")
 
-                    elif msg_type == "join_request":
-                        try:
-                            applicant = self.applicants.get()
-                        except Empty:
-                            print(f"Unable to locate applicant in queue")
-                            continue
-                        if len(self.children) < maximum_children:
-                            reply = {"type": "confirm_join",
-                                     "parent_address": self.sync_master_address}
-                            with self.children_lock:
-                                self.children.append([applicant[0], 0, applicant[1], False])
-
-                        else:
-                            n = math.inf
-                            with self.children_lock:
-                                for child in self.children:  # find child with smallest lineage
-                                    if child[1] < n:
-                                        selected = child[0]
-
-                            reply = {"type": "deny_join",
-                                     "address": selected}
-
-                        self.send_tcp_message(reply, applicant[1])
-
-                    elif msg_type == "suspect_crash":
-                        suspect = message.get("suspect")
-                        with self.children_lock:
-                            for child in self.children:
-                                if child[0] == suspect:
-                                    child[3] = True
-                                    break
+                    elif msg_type == "join_request" or msg_type == "suspect_crash":
+                        self._handle_applicants()
 
                     elif msg_type == "update_parent":
-                        self.join_timer(message.get("address"))
+                        self.join_timer(message.get("address"), seamless=True)
 
                     elif msg_type == "disconnect_notice":
                         pass
@@ -432,9 +400,80 @@ class PlatformClient:
                     self.send_tcp_message(msg, child[2])
 
 
+    def _handle_applicant(self):
+        message_list = []
+        while True: # pulls all messages out of queue
+            try:
+               message_list.append(self.inbox.get())
+            except Empty:
+                break
+
+        for message in message_list:  # puts back all messages that are not relevant
+            msg_type = message.get("type")
+            if msg_type != "suspect_crash" and msg_type != "join_request":
+                self.inbox.put(message)
+
+        while True:  # pulls out applicants and compares their addresses to messages
+            try:
+                applicant = self.applicants.get()
+                for message in message_list:
+                    sender = message.get("address")
+                    if applicant[0] == sender:
+                        if message.get("type") == "suspect_crash":
+                            self._suspected_crash(message, applicant)
+                        elif message.get("type") == "join_request":
+                            self._join_request(message, applicant)
+
+                        break
+
+            except Empty:
+                break
+
+    def _suspected_crash(self, message, applicant):
+        suspect = message.get("suspect")
+        action_taken = False
+        with self.children_lock:
+            for child in self.children:  # ensure that suspect is actually one of our children
+                if child[0] == suspect:
+                    if child[
+                        3] > time_until_suspicion / 2:  # check for non-responsiveness (less lenient due to suspicion of grandchild)
+                        msg = {"type": "disconnect_notice",
+                               "address": self.host}
+                        self.send_tcp_message(msg, child[2])
+                        child[2].close()
+                        self.children.remove(child)
+                        action_taken = True
+                        break
+        if action_taken:
+            pass
+        else:
+            msg = {"type": "update_parent",
+                   "address": self.min_lineage()[0]}
 
 
+        self.send_tcp_message(msg, applicant[1])
 
+    def _join_request(self, message, applicant):
+        if len(self.children) < maximum_children:
+            reply = {"type": "confirm_join",
+                     "parent_address": self.sync_master_address}
+            with self.children_lock:
+                self.children.append([applicant[0], 0, applicant[1], False])
+
+        else:
+            reply = {"type": "deny_join",
+                     "address": self.min_lineage()[0]}
+
+        self.send_tcp_message(reply, applicant[1])
+
+    def min_lineage(self):
+        n = math.inf
+        with self.children_lock:
+            for child in self.children:  # find child with smallest lineage
+                if child[1] < n:
+                    selected = child
+                    n = child[2]
+        return selected
     def add_calendar_event(self, title, description, time_str):
         event = {
             "title": title,
