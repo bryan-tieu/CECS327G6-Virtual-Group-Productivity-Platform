@@ -281,7 +281,7 @@ class PlatformClient:
 
                 # this is also where we do failure handling
                 #   if master is suspected, ask grandmaster for permission to take up its role
-                #   grandmaster should respond with an update_parent or a promotion, depending on
+                #   grandmaster should respond with an update_parent, with the new parent depending on
                 #   whether it still has contact with the suspected process
 
                 if crash_suspected:
@@ -341,7 +341,11 @@ class PlatformClient:
                         pass
 
                     elif msg_type == "promotion":
-                        pass
+                        self._promotion()
+                        if self.sync_grandmaster is None:  # if we were one step below the master clock
+                            self.sync_master = None
+                            self.sync_master_address = None
+
 
 
 
@@ -390,8 +394,7 @@ class PlatformClient:
                 new_children.remove((selected, n))
                 self.children.remove(child)
 
-                msg = {"type": "promotion",
-                       "children": new_children}
+                msg = {"type": "promotion"}
                 self.send_tcp_message(msg, s)
 
                 msg = {"type": "update_parent",
@@ -435,8 +438,7 @@ class PlatformClient:
         with self.children_lock:
             for child in self.children:  # ensure that suspect is actually one of our children
                 if child[0] == suspect:
-                    if child[
-                        3] > time_until_suspicion / 2:  # check for non-responsiveness (less lenient due to suspicion of grandchild)
+                    if child[3] > time_until_suspicion / 2:  # check for non-responsiveness (less lenient due to suspicion of grandchild)
                         msg = {"type": "disconnect_notice",
                                "address": self.host}
                         self.send_tcp_message(msg, child[2])
@@ -444,12 +446,19 @@ class PlatformClient:
                         self.children.remove(child)
                         action_taken = True
                         break
-        if action_taken:
-            pass
-        else:
-            msg = {"type": "update_parent",
-                   "address": self.min_lineage()[0]}
+            if action_taken:
+                msg = {"type": "update_parent",
+                       "address": self.host}
+            else:
+                suitable_replacement = self.host  # default to ourselves, in case we have no other children
+                n = math.inf
+                for child in self.children:  # find child with smallest lineage
+                    if child[1] < n:
+                        suitable_replacement = child[0]
+                        n = child[1]
 
+                msg = {"type": "update_parent",
+                       "address": suitable_replacement}
 
         self.send_tcp_message(msg, applicant[1])
 
@@ -472,7 +481,7 @@ class PlatformClient:
             for child in self.children:  # find child with smallest lineage
                 if child[1] < n:
                     selected = child
-                    n = child[2]
+                    n = child[1]
         return selected
     def add_calendar_event(self, title, description, time_str):
         event = {
