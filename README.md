@@ -20,12 +20,6 @@ pip install fastapi uvicorn redis pydantic requests
 # On Ubuntu/Debian
 sudo systemctl start redis-server
 
-# On macOS (if installed via Homebrew)
-brew services start redis
-
-# On Windows (if installed via Chocolatey)
-redis-server
-
 # Or run directly
 redis-server
 ```
@@ -145,28 +139,6 @@ time.sleep(10)
 platform.stop()
 "
 ```
-
-### Manual Verification Checklist
-
-#### Basic System Health
-- [ ] Redis server is running (`redis-cli ping` should return "PONG")
-- [ ] FastAPI docs available at http://localhost:8000/docs
-- [ ] Health endpoint returns status: `curl http://localhost:8000/health`
-
-#### API Functionality
-- [ ] Calendar events can be created, read, updated, deleted
-- [ ] Goals can be created, marked complete, deleted
-- [ ] Pomodoro timer can be started, stopped, and queried
-
-#### Real-time Features
-- [ ] Timer updates are broadcast to connected clients
-- [ ] Calendar changes are synchronized in real-time
-- [ ] Goal completions trigger notifications
-
-#### Distributed Features
-- [ ] Multiple clients can connect simultaneously
-- [ ] P2P timer synchronization works
-- [ ] Pub/Sub messages are being processed
 
 ## Architecture & Components
 
