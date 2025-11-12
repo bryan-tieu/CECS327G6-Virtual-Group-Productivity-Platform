@@ -26,6 +26,7 @@ class PlatformClient:
         self.active_input = False
         self.timer_running = False
         self.sync_master = None
+        self.sync_master_address = None
         self.sync_grandmaster = None
         self.children = []
         self.applicants = Queue()
@@ -163,8 +164,7 @@ class PlatformClient:
         else:
             print(f"[Server] Message: {msg}")
 
-    
-    #TCP message
+    # TCP message
     def send_tcp_message(self, msg, sock):
         try:
             wire = (json.dumps(msg) + "\n").encode("utf-8")
@@ -175,21 +175,18 @@ class PlatformClient:
         except Exception as e:
             print(f"[Client] Error sending tcp message: {e}")
 
-
-    #Commands
+    # Commands
     def start_timer(self, duration=default_timer_length):
         if self.timer_running:
             self.stop_timer()
 
         self.sync_master = None  # this might end up being redundant
+        self.sync_master_address = None
 
         # initialize timer
 
         self.time_left = duration
         self.timer_running = True
-
-
-
 
     def join_timer(self, address):
         # this should ask an existing process to join its timer
@@ -203,11 +200,8 @@ class PlatformClient:
                }
         temp = self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         temp.connect((address, self.p2p_port))
-
         self.send_tcp_message(msg, temp)
-
-
-
+        self.sync_master_address = address
 
     def stop_timer(self):
         if self.sync_master is None and self.timer_running:  # if this is the master clock
@@ -221,21 +215,16 @@ class PlatformClient:
             self.send_tcp_message(msg, self.sync_master)
             self.sync_master.close()
 
-
-
-
         # state cleanup
         self.time_left = 0.0
-        self.children = []
-
+        with self.children_lock:
+            self.children = []
         self.sync_master = None
+        self.sync_master_address = None
         self.sync_grandmaster = None
         self.timer_running = False
 
-
-
-
-    #Timer functions
+    # Timer functions
     def _request_sync(self):
         # this should ask our syncing master for an update
         lineage = 1
@@ -252,11 +241,10 @@ class PlatformClient:
         # to manage any child processes using us as a syncing master
 
         # if another process tries to join our timer, either add them as a child directly
-        # or tell them to join one of our children (join_timer should be recursive)
+        # or tell them to join one of our children
         # this will depend on if we have the maximum number of children already (whatever we decide to set that to)
 
         crash_suspected = False
-
 
         while True:
             if self.timer_running:  # prevents thread from using resources if no timer is active
@@ -272,13 +260,12 @@ class PlatformClient:
                 #   grandmaster should respond with a update_parent, with the identity of the parent depending on
                 #   whether it still has contact with the suspected process
 
-
                 # check for sync requests and respond accordingly
 
                 # check for join requests and respond accordingly
                 while True:
                     try:
-                        message = self.inbox.get()
+                        message = self.inbox.get(block=False, timeout=tick_rate)
                         print(message)
                     except Empty:
                         break
@@ -293,9 +280,24 @@ class PlatformClient:
                         except Empty:
                             print(f"Unable to locate applicant in queue")
                             continue
+                        if len(self.children) < maximum_children:
+                            reply = {"type": "confirm_join",
+                                     "parent_address": self.sync_master_address}
+                            with self.children_lock:
+                                self.children.append((applicant[0], 0, applicant[1]))
 
-                        with self.children_lock:
-                            self.children.append((applicant[0], math.inf, applicant[1]))
+                        else:
+                            n = math.inf
+                            with self.children_lock:
+                                for child in self.children:  # find child with smallest lineage
+                                    if child[1] < n:
+                                        selected = child[0]
+
+                            reply = {"type": "deny_join",
+                                     "address": selected}
+
+                        self.send_tcp_message(reply, applicant[1])
+
 
             else:  # used for joining timers
                 while True:
@@ -308,14 +310,13 @@ class PlatformClient:
 
                     msg_type = message.get("type")
                     if msg_type == "confirm_join":
-                        parent = message.get("address")
-
                         self.sync_master = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                         self.sync_master.connect((self.host, self.p2p_port))
 
                         self.sync_grandmaster = message.get("parent_address")
                         self.timer_running = True
                     elif msg_type == "deny_join":
+                        self.sync_master_address = None  # to ensure no garbage retention
                         self.join_timer(message.get("address"))
                     # all unrelated messages are discarded
 
