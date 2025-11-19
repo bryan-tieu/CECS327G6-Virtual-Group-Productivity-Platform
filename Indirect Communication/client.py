@@ -38,6 +38,8 @@ class PlatformClient:
         self.inbox_lock = threading.Lock()
         self.server_connected = False  # tracks if a connection has been made with the central server
         self.last_requested = None  # last time a sync was requested
+        self.lamport_clock = 0
+
 
         # start tcp listener
         tcp_listen_thread = threading.Thread(target=self.tcp_listener)
@@ -530,6 +532,17 @@ class PlatformClient:
             "user": user,
             "completed": completed
         }, self.server_socket)
+    
+    #Lamport clock methods
+    def lamport_event(self):
+        self.lamport_clock += 1
+
+    def lamport_send(self):
+        self.lamport_clock += 1
+        return self.lamport_clock
+    
+    def lamport_receive(self, recv_timestamp):
+        self.lamport_clock = max(self.lamport_clock, recv_timestamp) + 1
 
 
 
