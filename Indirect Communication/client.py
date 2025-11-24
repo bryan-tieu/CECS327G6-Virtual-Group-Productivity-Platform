@@ -93,7 +93,7 @@ class PlatformClient:
                 t.start()
 
     def _handle_p2p_client(self, client_socket, address):
-
+        buffer = b""
         try:
 
             while True:
@@ -102,10 +102,29 @@ class PlatformClient:
 
                 if not data:
                     break
+                buffer += data
 
-                message = json.loads(data.decode())
-                print(f"Message received from {address}: {message}")
-                self.inbox.put(message)
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    if not line:
+                        continue
+
+                    message = json.loads(line.decode("utf-8"))
+
+                    #Test (M4...)
+                    if "lamport" in message:
+                        self.lamport_receive(message["lamport"])
+                        print(f"[Lamport={self.lamport_clock}] Updated clock from message")
+
+                    #print(f"Message received from {address}: {message}")
+                    #self.inbox.put(message)
+
+                    #Process join messages
+                    msg_type = message.get("type")
+                    if msg_type in ("join_request", "suspect_crash"):
+                        self._handle_applicants(message)
+                    else:
+                        self.inbox.put(message)
 
         except (ConnectionResetError, json.JSONDecodeError):
             print(f"TCP Client {address} disconnected")
@@ -116,7 +135,7 @@ class PlatformClient:
                 for child in self.children:
                     if child[0] == address:
                         self.children.remove(child)
-                    break
+                        break
 
             client_socket.close()
 
@@ -138,16 +157,22 @@ class PlatformClient:
 
                         try:
                             message = json.loads(line.decode("utf-8"))
+                            #Test (M4...)
+                            if "lamport" in message:
+                                self.lamport_receive(message["lamport"])
                         except Exception as e:
                             print(f"[Client] JSON parse error: {e}")
                             continue
-
-                        self.handle_server_message(message)
+                        
+                        #Test (Use for no ticks...)
+                        if not self.active_input or message.get("type") != "tick":
+                            self.handle_server_message(message)
 
                 except Exception as e:
                     print(f"[Client] TCP listener error: {e}")
 
     def handle_server_message(self, msg):
+        self.lamport_event()
         # for handling messages from central server
         msg_type = msg.get("type")
 
@@ -168,17 +193,21 @@ class PlatformClient:
     # TCP message
     def send_tcp_message(self, msg, sock):
         try:
+            #Test (M4...)
+            msg["lamport"] = self.lamport_send()
+
             wire = (json.dumps(msg) + "\n").encode("utf-8")
             # need to add addressing functionality (send message only to specified destination)
             # also prevent sending messages to anything other than children/server (except for disconnect_notice type)
 
             sock.sendall(wire)
-            print(f"Sent message {msg} to {sock}")
+            print(f"[Lamport={msg['lamport']}] Sent message {msg} to {sock}")
         except Exception as e:
             print(f"[Client] Error sending tcp message: {e}")
 
     # Commands
     def start_timer(self, duration=default_timer_length):
+        self.lamport_event()
         if self.timer_running:
             self.stop_timer()
 
@@ -192,6 +221,7 @@ class PlatformClient:
 
     def join_timer(self, address, seamless=False):
         # this should ask an existing process to join its timer
+        self.lamport_event()
         # seamless joins are not visible to the user and are used to switch parents on an existing network
         if self.timer_running and not seamless:
             self.stop_timer()
@@ -207,13 +237,59 @@ class PlatformClient:
             self.sync_master.connect((address, self.p2p_port))
         except Exception as e:
             print(f"[Client] Connection failed: {e}")
+            self.lamport_event()
         else:
             if not seamless:
                 print(f"[Client] Connected to server at {address}:{self.p2p_port}, sending join request")
             self.send_tcp_message(msg, self.sync_master)
             self.sync_master_address = address
 
+        self.join_reply_wait()
+
+    #Assists join_timer...
+    def join_reply_wait(self, timeout=5):
+        start = time.time()
+        buffer = b""
+        self.sync_master.settimeout(0.1)
+
+        while time.time() - start < timeout:
+            try:
+                data = self.sync_master.recv(1024)
+                if not data:
+                    continue
+                    
+                buffer += data
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    if not line:
+                        continue
+                    message = json.loads(line.decode("utf-8"))
+
+                    if "lamport" in message:
+                        self.lamport_receive(message["lamport"])
+
+                    msg_type = message.get("type")
+                    if msg_type == "confirm_join":
+                        print("Join confirmed")
+                        self.sync_grandmaster = message.get("parent_address")
+                        self.timer_running = True
+                        return
+                    elif msg_type == "deny_join":
+                        print("Join denied... trying another")
+                        self.sync_master_address = None
+                        return
+                    
+            except socket.timeout:
+                continue
+            except Exception as e:
+                print(f"Error receiving join reply: {e}")
+                break
+
+        print("\nNo reply received... join timed out.")
+
+
     def stop_timer(self):
+        self.lamport_event()
         if self.sync_master is None and self.timer_running:  # if this is the master clock
             # designate another as master clock
             self._promotion()
@@ -268,10 +344,12 @@ class PlatformClient:
                 current = time.time()
                 if last_tick is not None:  # if the timer didn't just start
                     self.time_left -= current - last_tick
+                    self.lamport_event()
                     if crash_suspected:
                         response_timer += current - last_tick
                 last_tick = time.time()
                 if self.time_left <= 0:
+                    self.lamport_event()
                     print("Timer finished")
                     self.stop_timer()
 
@@ -279,6 +357,7 @@ class PlatformClient:
                     # check how long since last contact
                     if time.time() - self.last_sync > time_until_suspicion:
                         crash_suspected = True
+                        self.lamport_event()
                     else:
                         self._request_sync()
 
@@ -292,6 +371,7 @@ class PlatformClient:
                         if response_timer > time_until_suspicion:  # if we now suspect grandmaster as having crashed as well
                             self.sync_grandmaster = None  # see below
                     elif self.sync_grandmaster is None:  # if the master clock goes out or grandmaster crashes, assume its responsibility to lineage
+                        self.lamport_event()
                         print("Synced timer unresponsive, reverting to local timer.")
                         self.start_timer(self.time_left)
                         continue
@@ -315,6 +395,7 @@ class PlatformClient:
                 with self.children_lock:
                     for child in self.children:
                         if child[3] > time_until_suspicion * 2:  # this is very lenient due to grandparents also monitoring children
+                            self.lamport_event()
                             msg = {"type": "disconnect_notice",
                                    "address": self.host}
                             self.send_tcp_message(msg, child[2])
@@ -344,6 +425,8 @@ class PlatformClient:
                             self.send_tcp_message(reply, selected)
 
                     elif msg_type == "sync_update":
+                        self.lamport_receive(message["lamport"])
+                        self.lamport_event()
                         received = time.time()
                         try:
                             self.time_left = (received - self.last_requested)/2  # uses Cristian's Method for syncing
@@ -355,21 +438,25 @@ class PlatformClient:
                         self._handle_applicants(message)
 
                     elif msg_type == "update_parent":
+                        self.lamport_event()
                         self.join_timer(message.get("address"), seamless=True)
 
                     elif msg_type == "disconnect_notice":
                         sender = message.get("address")
                         if sender == self.sync_master_address:  # if our sync master disconnected, attempt to rejoin
+                            self.lamport_event()
                             self.join_timer(self.sync_master_address, seamless=True)
                         else:  # check if it was one of our children
                             with self.children_lock:
                                 for child in self.children:
                                     if sender == child[0]:
+                                        self.lamport_event()
                                         child[2].close()
                                         self.children.remove(child)
                                         break
 
                     elif msg_type == "promotion":
+                        self.lamport_event()
                         self._promotion()
                         if self.sync_grandmaster is None:  # if we were one step below the master clock
                             self.sync_master = None
@@ -378,7 +465,7 @@ class PlatformClient:
 
 
 
-            else:  # used for joining timers
+            """else:  # used for joining timers
                 while True:
                     # retrieve message from inbox until none are left
                     try:
@@ -387,6 +474,7 @@ class PlatformClient:
                     except Empty:
                         # if we are attempting to join and wating on a response
                         if time.time() - self.last_sync > time_until_suspicion and self.sync_master is not None:
+                            self.lamport_event()
                             print("Server took too long to respond, closing connection")
                             self.sync_master.close()
                             self.sync_master = None
@@ -395,20 +483,23 @@ class PlatformClient:
 
                     msg_type = message.get("type")
                     if msg_type == "confirm_join":
+                        self.lamport_event()
                         self.sync_master = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                         self.sync_master.connect((self.host, self.p2p_port))
 
                         self.sync_grandmaster = message.get("parent_address")
                         self.timer_running = True
                     elif msg_type == "deny_join":
+                        self.lamport_event()
                         self.sync_master_address = None  # to ensure no garbage retention
                         self.join_timer(message.get("address"))
-                    # all unrelated messages are discarded
+                    # all unrelated messages are discarded"""
 
             time.sleep(max(0, tick_rate - (time.time() - start_time)))
 
     def _promotion(self):
         # sends a promotion signal to the child with the least load
+        self.lamport_event()
         n = math.inf
         with self.children_lock:
             if self.children:  # if we have children
@@ -421,14 +512,14 @@ class PlatformClient:
                         s = child[2]
 
                 if new_children:
-                    new_children.remove((selected, n))
-                self.children.remove(child)
+                    new_children.remove((selected[0], selected[1]))
+                self.children.remove(selected)
 
                 msg = {"type": "promotion"}
                 self.send_tcp_message(msg, s)
 
                 msg = {"type": "update_parent",
-                       "address": selected}
+                       "address": selected[0]}
                 for child in self.children:  # for all other children
                     self.send_tcp_message(msg, child[2])
 
@@ -448,14 +539,15 @@ class PlatformClient:
 
         while True:  # pulls out applicants and compares their addresses to messages
             try:
-                applicant = self.applicants.get()
+                applicant = self.applicants.get_nowait()
                 for message in message_list:
                     sender = message.get("address")
                     if applicant[0][0] == sender:
                         if message.get("type") == "suspect_crash":
                             self._suspected_crash(message, applicant)
                         elif message.get("type") == "join_request":
-                            self._join_request(applicant)
+                            applicant_sock = applicant[1]
+                            self._join_request(applicant, applicant_sock)
 
                         break
 
@@ -489,21 +581,27 @@ class PlatformClient:
 
                 msg = {"type": "update_parent",
                        "address": suitable_replacement}
-
+        
+        self.lamport_event()
         self.send_tcp_message(msg, applicant[1])
 
-    def _join_request(self, applicant):
+    def _join_request(self, applicant, applicant_sock):
         if len(self.children) < maximum_children:
+            parent_addr = self.sync_master_address if self.sync_master_address else self.host
             reply = {"type": "confirm_join",
-                     "parent_address": self.sync_master_address}
+                     "parent_address": parent_addr}
             with self.children_lock:
-                self.children.append([applicant[0][0], 0, applicant[1], False])
+                self.children.append([applicant[0][0], 0, applicant_sock, False])
+            self.lamport_event()
+            #print(f"[DEBUG] Sending confirm_join to {applicant[0][0]} with parent {parent_addr}")
 
         else:
             reply = {"type": "deny_join",
                      "address": self.min_lineage()[0]}
+            self.lamport_event()
+            #print(f"[DEBUG] Sending deny_join to {applicant[0][0]}")
 
-        self.send_tcp_message(reply, applicant[1])
+        self.send_tcp_message(reply, applicant_sock)
 
     def min_lineage(self):
         n = math.inf
@@ -515,6 +613,7 @@ class PlatformClient:
         return selected
 
     def add_calendar_event(self, title, description, time_str):
+        self.lamport_event()
         event = {
             "title": title,
             "description": description,
@@ -526,6 +625,7 @@ class PlatformClient:
         }, self.server_socket)
 
     def update_goal(self, goal, user, completed=False):
+        self.lamport_event()
         self.send_tcp_message({
             "type": "goal_update",
             "goal": goal,
@@ -554,7 +654,6 @@ if __name__ == "__main__":
     # Get user input
     while True:
         # time.sleep(1)
-
         print("\nCommand Options (Enter number):\n"
         "1. Start Timer\n"
         "2. Stop Timer\n"
@@ -563,6 +662,10 @@ if __name__ == "__main__":
         "5. Update Goal\n"
         
         "0. Exit\n")
+
+        #Commment out to allow for ticks...
+        client.active_input = True
+        
 
         option = input("Select Option: ")
 
