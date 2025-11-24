@@ -208,6 +208,33 @@ class PlatformClient:
         elif msg_type == "tx_error":
             print(f"[TX {msg.get('tx_id')}] Error: {msg.get('reason')}")
 
+        elif msg_type == "tx_debug_info":
+            print("\n--- Transaction Debug Info ---")
+
+            txs = msg.get("transactions", [])
+            if not txs:
+                print("No transactions recorded.")
+            else:
+                print("\n-- Transactions --")
+                for tx in txs:
+                    me_flag = "[ME]" if tx.get("is_mine") else "[OTHER]"
+                    print(f"{me_flag} TX {tx['tx_id']} [{tx['state']}] ops={tx['num_ops']}")
+                    for op in tx.get("ops", []):
+                        print(f"   - {op.get('op_type')} {op.get('payload')}")
+
+            locks = msg.get("locks", [])
+            if not locks:
+                print("\n-- Locks --")
+                print("No locks currently held.")
+            else:
+                print("\n-- Locks --")
+                for lock in locks:
+                    me_flag = "[ME]" if lock.get("owned_by_me") else "[OTHER]"
+                    print(f"{me_flag} {lock['resource']} held by TX {lock['tx_id']}")
+
+            print("--- End Transaction Debug Info ---")
+            self.active_input = True
+
         else:
             print(f"[Server] Message: {msg}")
 
@@ -650,6 +677,15 @@ class PlatformClient:
         msg = {"type": "tx_begin"}
         self.send_tcp_message(msg, self.server_socket)
 
+    # Transaction Debug Helper
+    def request_tx_debug(self):
+        """
+        Ask the server for a snapshot of all transactions and locks.
+        """
+        self.active_input = False
+        msg = {"type": "tx_debug"}
+        self.send_tcp_message(msg, self.server_socket)
+
     def commit_transaction(self):
         if self.current_tx_id is None:
             print("No active transaction.")
@@ -681,7 +717,6 @@ class PlatformClient:
         }
         self.send_tcp_message(msg, self.server_socket)
 
-
     def tx_update_goal(self, goal, user, completed=False):
         if self.current_tx_id is None:
             print("No active transaction. Start one first.")
@@ -699,24 +734,28 @@ class PlatformClient:
         }
         self.send_tcp_message(msg, self.server_socket)
 
+    
 
 if __name__ == "__main__":
     client = PlatformClient()
     client.connect_servers()
-
+    client.active_input = True
     # Get user input
     while True:
+        if not client.running:
+            break
+        if not client.active_input:
+            time.sleep(0.1)
+            continue
+
         # time.sleep(1)
         print("\nCommand Options (Enter number):\n"
         "1. Start Timer\n"
         "2. Stop Timer\n"
         "3. Join Timer\n"
         "4. Begin Transaction\n"
-        
+        "5. List Transactions / Locks\n"
         "0. Exit\n")
-
-        #Commment out to allow for ticks...
-        client.active_input = True
         
 
         option = input("Select Option: ")
@@ -730,8 +769,6 @@ if __name__ == "__main__":
         elif option == "3":
             address = input("Enter address: ")
             client.join_timer(address)
-
-            client.active_input = False
 
         elif option == "4":
             # Begin a new transaction
@@ -776,6 +813,11 @@ if __name__ == "__main__":
                 
                 else:
                     print("Invalid input...")
+            client.active_input = True
+                
+        elif option == "5": 
+            client.request_tx_debug()
+            client.active_input = False
 
         elif option == "0":
             print("Exiting...")

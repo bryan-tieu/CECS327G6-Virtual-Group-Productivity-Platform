@@ -169,6 +169,10 @@ class PlatformServer:
 
         elif msg_type == "tx_abort":
             self._handle_tx_abort(message, client_socket)
+        
+        elif msg_type == "tx_debug":
+            self._handle_tx_debug(message, client_socket)
+
     
     # Transaction Helpers
     def _handle_tx_begin(self, message, client_socket):
@@ -349,6 +353,45 @@ class PlatformServer:
 
         reply = {"type": "tx_aborted", "tx_id": tx_id, "reason": "client_abort"}
         client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+
+    def _handle_tx_debug(self, message, client_socket):
+        """
+        Send a snapshot of all transactions and current locks to the requesting client.
+        Marks which transactions / locks belong to this client so they can tell
+        what "other users" are holding.
+        """
+        # Build transaction snapshot
+        tx_list = []
+        for tx_id, tx_data in self.transactions.items():
+            tx_list.append({
+                "tx_id": tx_id,
+                "state": tx_data.get("state"),
+                "num_ops": len(tx_data.get("ops", [])),
+                "ops": tx_data.get("ops", []),
+                "is_mine": (tx_data.get("client") is client_socket),
+            })
+
+        # Build lock snapshot
+        lock_list = []
+        for resource_key, owner_tx_id in self.locks.items():
+            owner_tx = self.transactions.get(owner_tx_id)
+            owned_by_me = bool(owner_tx and owner_tx.get("client") is client_socket)
+            lock_list.append({
+                "resource": resource_key,
+                "tx_id": owner_tx_id,
+                "owned_by_me": owned_by_me,
+            })
+
+        reply = {
+            "type": "tx_debug_info",
+            "transactions": tx_list,
+            "locks": lock_list,
+        }
+        try:
+            client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+        except Exception:
+            # If the client disconnected between request and response, just drop it.
+            pass
 
     # Timer state control
     def _handle_timer_control(self, message):
