@@ -25,7 +25,11 @@ class PlatformServer:
         self.shutdown_event = threading.Event()
         self.broadcast_q = Queue()
         self.clients_lock = threading.Lock()
-    
+
+        self.transactions = {} 
+        self.next_tx_id = 1
+        self.locks = {} # resource key -> tx_id
+        
     # Starting the central server
     def start_server(self):
         
@@ -47,6 +51,14 @@ class PlatformServer:
         self._sender_thread = threading.Thread(target=self._send_loop, daemon=True)
         self._sender_thread.start()
         
+        # Background cleanup
+        self.tx_timeout_seconds = 60
+        self._tx_cleanup_thread = threading.Thread(
+            target=self._cleanup_stale_transactions,
+            daemon=True,
+        )
+        self._tx_cleanup_thread.start()
+
         try:
             
             while True:
@@ -129,11 +141,21 @@ class PlatformServer:
             print(f"TCP Client {address} disconnected")
             
         finally:
-            
+            # Abort any active transactions belonging to this client
+            # (this covers normal disconnects AND crashes that result in socket close)
+            owned_tx_ids = [
+                tx_id
+                for tx_id, tx in list(self.transactions.items())
+                if tx["client"] is client_socket and tx["state"] == "active"
+            ]
+            for tx_id in owned_tx_ids:
+                # no need to notify: the client is already gone
+                self._abort_tx_internal(tx_id, reason="client_disconnect", notify_client=False)
+
             with self.clients_lock:
                 if client_socket in self.connected_clients:
                     self.connected_clients.remove(client_socket)
-                
+            
             client_socket.close()
             
     # TCP messsages
@@ -153,7 +175,270 @@ class PlatformServer:
             
         elif msg_type == "request_sync":
             self._send_sync_data(client_socket)
-            
+
+        elif msg_type == "tx_begin":
+            self._handle_tx_begin(message, client_socket)
+
+        elif msg_type == "tx_op":
+            self._handle_tx_op(message, client_socket)
+
+        elif msg_type == "tx_commit":
+            self._handle_tx_commit(message, client_socket)
+
+        elif msg_type == "tx_abort":
+            self._handle_tx_abort(message, client_socket)
+        
+        elif msg_type == "tx_debug":
+            self._handle_tx_debug(message, client_socket)
+
+    
+    # Transaction Helpers
+    def _handle_tx_begin(self, message, client_socket):
+        tx_id = self.next_tx_id
+        self.next_tx_id += 1
+
+        self.transactions[tx_id] = {
+            "client": client_socket,
+            "ops": [],
+            "state": "active",
+            "last_activity": time.time(),
+        }
+
+        reply = {
+            "type": "tx_started",
+            "tx_id": tx_id
+        }
+        client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+
+    def _handle_tx_op(self, message, client_socket):
+        tx_id = message.get("tx_id")
+        tx = self.transactions.get(tx_id)
+
+        if not tx or tx["state"] != "active":
+            reply = {"type": "tx_error", "tx_id": tx_id, "reason": "invalid_or_not_active"}
+            client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+            return
+
+        op_type = message.get("op_type")
+        payload = message.get("payload", {})
+
+        # define a resource key for locking
+        if op_type == "calendar_event":
+            time_str = payload.get("scheduled_time")
+            if not time_str:
+                reply = {
+                    "type": "tx_error",
+                    "tx_id": tx_id,
+                    "reason": "missing_scheduled_time",
+                }
+                client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+                return
+
+            # Uniqueness against COMMITTED events
+            if self._is_time_slot_taken(time_str):
+                tx["state"] = "aborted"
+                reply = {
+                    "type": "tx_aborted",
+                    "tx_id": tx_id,
+                    "reason": "this time slot is already taken",
+                    "scheduled_time": time_str,
+                }
+                client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+                return
+
+            # Uniqueness inside THIS transaction (same tx adding same time twice)
+            for existing_op in tx["ops"]:
+                if (
+                    existing_op["op_type"] == "calendar_event"
+                    and existing_op["payload"].get("scheduled_time") == time_str
+                ):
+                    tx["state"] = "aborted"
+                    reply = {
+                        "type": "tx_aborted",
+                        "tx_id": tx_id,
+                        "reason": "Someone already reserved this time slot before you moments ago",
+                        "scheduled_time": time_str,
+                    }
+                    client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+                    return
+
+            resource_key = f"calendar:{time_str}"
+        elif op_type == "goal_update":
+            user = payload.get("user")
+            goal = payload.get("goal")
+            resource_key = f"goal:{user}:{goal}"
+        else:
+            # unknown op
+            resource_key = None
+
+        # simple locking: one owner per resource
+        if resource_key:
+            owner = self.locks.get(resource_key)
+            if owner is not None and owner != tx_id:
+                # conflict -> abort this transaction
+                tx["state"] = "aborted"
+                reply = {
+                    "type": "tx_aborted",
+                    "tx_id": tx_id,
+                    "reason": "lock_conflict",
+                    "resource": resource_key
+                }
+                client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+                return
+            else:
+                self.locks[resource_key] = tx_id
+
+        # still active: record the operation for later commit
+        tx["ops"].append({"op_type": op_type, "payload": payload})
+        tx["last_activity"] = time.time()
+        reply = {"type": "tx_op_ok", "tx_id": tx_id}
+        client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+
+    def _handle_tx_commit(self, message, client_socket):
+        tx_id = message.get("tx_id")    
+        tx = self.transactions.get(tx_id)
+
+        if not tx or tx["state"] != "active":
+            reply = {"type": "tx_error", "tx_id": tx_id, "reason": "cannot_commit"}
+            client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+            return
+
+        # apply all operations
+        for op in tx["ops"]:
+            op_type = op["op_type"]
+            payload = op["payload"]
+
+            if op_type == "calendar_event":
+                self._apply_calendar_tx(payload)
+            elif op_type == "goal_update":
+                self._apply_goal_tx(payload)
+
+        # release locks
+        to_release = [key for key, owner in self.locks.items() if owner == tx_id]
+        for key in to_release:
+            del self.locks[key]
+
+        tx["state"] = "committed"
+
+        reply = {"type": "tx_committed", "tx_id": tx_id}
+        client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+
+    def _apply_calendar_tx(self, incoming_event):
+        with self.lock:
+            event = dict(incoming_event)
+            event["id"] = len(self.calendar_events) + 1
+            self.calendar_events.append(event)
+
+        self._broadcast_tcp_message({
+            "type": "calendar_update",
+            "event": event,
+            "all_events": self.calendar_events
+        })
+
+    def _is_time_slot_taken(self, time_str: str) -> bool:
+        """Return True if scheduled_time already exists in committed events."""
+        with self.lock:
+            for ev in self.calendar_events:
+                if ev.get("scheduled_time") == time_str:
+                    return True
+        return False
+
+    def _apply_goal_tx(self, payload):
+        # based on _handle_goal_update
+        self._broadcast_tcp_message({
+            "type": "goal_update",
+                "goal": payload.get("goal"),
+                "user": payload.get("user"),
+                "completed": payload.get("completed", False)
+        })
+
+    def _abort_tx_internal(self, tx_id, reason="client_abort", notify_client=True):
+        tx = self.transactions.get(tx_id)
+        if not tx or tx["state"] != "active":
+            return
+
+        tx["state"] = "aborted"
+
+        # release locks held by this tx
+        to_release = [key for key, owner in list(self.locks.items()) if owner == tx_id]
+        for key in to_release:
+            del self.locks[key]
+
+        if notify_client:
+            client = tx["client"]
+            reply = {"type": "tx_aborted", "tx_id": tx_id, "reason": reason}
+            try:
+                client.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+            except OSError:
+                # client might already be gone
+                pass
+
+    def _handle_tx_abort(self, message, client_socket):
+        tx_id = message.get("tx_id")
+        self._abort_tx_internal(tx_id, reason="client_abort", notify_client=True)
+
+    def _handle_tx_debug(self, message, client_socket):
+        """
+        Send a snapshot of all transactions and current locks to the requesting client.
+        Marks which transactions / locks belong to this client so they can tell
+        what "other users" are holding.
+        """
+        # Build transaction snapshot
+        tx_list = []
+        for tx_id, tx_data in self.transactions.items():
+            tx_list.append({
+                "tx_id": tx_id,
+                "state": tx_data.get("state"),
+                "num_ops": len(tx_data.get("ops", [])),
+                "ops": tx_data.get("ops", []),
+                "is_mine": (tx_data.get("client") is client_socket),
+            })
+
+        # Build lock snapshot
+        lock_list = []
+        for resource_key, owner_tx_id in self.locks.items():
+            owner_tx = self.transactions.get(owner_tx_id)
+            owned_by_me = bool(owner_tx and owner_tx.get("client") is client_socket)
+            lock_list.append({
+                "resource": resource_key,
+                "tx_id": owner_tx_id,
+                "owned_by_me": owned_by_me,
+            })
+
+        reply = {
+            "type": "tx_debug_info",
+            "transactions": tx_list,
+            "locks": lock_list,
+        }
+        try:
+            client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+        except Exception:
+            # If the client disconnected between request and response, just drop it.
+            pass
+    
+    
+    def _cleanup_stale_transactions(self):
+        check_interval = 5  # seconds between sweeps
+        while not self.shutdown_event.is_set():
+            now = time.time()
+            # make a snapshot list to avoid modifying the dict while iterating
+            for tx_id, tx in list(self.transactions.items()):
+                if tx.get("state") != "active":
+                    continue
+
+                last = tx.get("last_activity", now)
+                if now - last > self.tx_timeout_seconds:
+                    print(f"[TX {tx_id}] Timing out after {self.tx_timeout_seconds}s of inactivity")
+                    # Notify client if it’s still around
+                    self._abort_tx_internal(
+                        tx_id,
+                        reason="timeout",
+                        notify_client=True
+                    )
+
+            time.sleep(check_interval)
+
+
     # Timer state control
     def _handle_timer_control(self, message):
         
@@ -182,6 +467,9 @@ class PlatformServer:
             "timer_state": self.pomoTimer_state
         })
         
+    
+    
+
     # Broadcast TCP messages to clients (users)
     def _broadcast_tcp_message(self, message):
         

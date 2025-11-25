@@ -40,6 +40,7 @@ class PlatformClient:
         self.last_requested = None  # last time a sync was requested
         self.lamport_clock = 0
 
+        self.current_tx_id = None
 
         # start tcp listener
         tcp_listen_thread = threading.Thread(target=self.tcp_listener)
@@ -186,6 +187,53 @@ class PlatformClient:
 
         elif msg_type == "timer_complete":
             print("[Timer] Pomodoro session complete")
+        
+        elif msg_type == "tx_started":
+            self.current_tx_id = msg["tx_id"]
+            print(f"[TX] Began transaction {self.current_tx_id}")
+
+        elif msg_type == "tx_op_ok":
+            print(f"[TX {msg['tx_id']}] Operation recorded")
+
+        elif msg_type == "tx_committed":
+            print(f"[TX {msg['tx_id']}] Commit successful")
+            if self.current_tx_id == msg["tx_id"]:
+                self.current_tx_id = None
+
+        elif msg_type == "tx_aborted":
+            print(f"[TX {msg['tx_id']}] Aborted: {msg.get('reason')}")
+            if self.current_tx_id == msg["tx_id"]:
+                self.current_tx_id = None
+
+        elif msg_type == "tx_error":
+            print(f"[TX {msg.get('tx_id')}] Error: {msg.get('reason')}")
+
+        elif msg_type == "tx_debug_info":
+            print("\n--- Transaction Debug Info ---")
+
+            txs = msg.get("transactions", [])
+            if not txs:
+                print("No transactions recorded.")
+            else:
+                print("\n-- Transactions --")
+                for tx in txs:
+                    me_flag = "[ME]" if tx.get("is_mine") else "[OTHER]"
+                    print(f"{me_flag} TX {tx['tx_id']} [{tx['state']}] ops={tx['num_ops']}")
+                    for op in tx.get("ops", []):
+                        print(f"   - {op.get('op_type')} {op.get('payload')}")
+
+            locks = msg.get("locks", [])
+            if not locks:
+                print("\n-- Locks --")
+                print("No locks currently held.")
+            else:
+                print("\n-- Locks --")
+                for lock in locks:
+                    me_flag = "[ME]" if lock.get("owned_by_me") else "[OTHER]"
+                    print(f"{me_flag} {lock['resource']} held by TX {lock['tx_id']}")
+
+            print("--- End Transaction Debug Info ---")
+            self.active_input = True
 
         else:
             print(f"[Server] Message: {msg}")
@@ -612,27 +660,6 @@ class PlatformClient:
                     n = child[1]
         return selected
 
-    def add_calendar_event(self, title, description, time_str):
-        self.lamport_event()
-        event = {
-            "title": title,
-            "description": description,
-            "scheduled_time": time_str
-        }
-        self.send_tcp_message({
-            "type": "calendar_event",
-            "event": event
-        }, self.server_socket)
-
-    def update_goal(self, goal, user, completed=False):
-        self.lamport_event()
-        self.send_tcp_message({
-            "type": "goal_update",
-            "goal": goal,
-            "user": user,
-            "completed": completed
-        }, self.server_socket)
-    
     #Lamport clock methods
     def lamport_event(self):
         self.lamport_clock += 1
@@ -644,27 +671,91 @@ class PlatformClient:
     def lamport_receive(self, recv_timestamp):
         self.lamport_clock = max(self.lamport_clock, recv_timestamp) + 1
 
+    # Transactions
+    def begin_transaction(self):
+        self.lamport_event()
+        msg = {"type": "tx_begin"}
+        self.send_tcp_message(msg, self.server_socket)
 
+    # Transaction Debug Helper
+    def request_tx_debug(self):
+        """
+        Ask the server for a snapshot of all transactions and locks.
+        """
+        self.active_input = False
+        msg = {"type": "tx_debug"}
+        self.send_tcp_message(msg, self.server_socket)
 
+    def commit_transaction(self):
+        if self.current_tx_id is None:
+            print("No active transaction.")
+            return
+        msg = {"type": "tx_commit", "tx_id": self.current_tx_id}
+        self.send_tcp_message(msg, self.server_socket)
+
+    def abort_transaction(self):
+        if self.current_tx_id is None:
+            return
+        msg = {"type": "tx_abort", "tx_id": self.current_tx_id}
+        self.send_tcp_message(msg, self.server_socket)
+        self.current_tx_id = None
+
+    def tx_add_calendar_event(self, title, description, time_str):
+        if self.current_tx_id is None:
+            print("No active transaction. Start one first.")
+            return
+        payload = {
+            "title": title,
+            "description": description,
+            "scheduled_time": time_str
+        }
+        msg = {
+            "type": "tx_op",
+            "tx_id": self.current_tx_id,
+            "op_type": "calendar_event",
+            "payload": payload
+        }
+        self.send_tcp_message(msg, self.server_socket)
+
+    def tx_update_goal(self, goal, user, completed=False):
+        if self.current_tx_id is None:
+            print("No active transaction. Start one first.")
+            return
+        payload = {
+            "goal": goal,
+            "user": user,
+            "completed": completed
+        }
+        msg = {
+            "type": "tx_op",
+            "tx_id": self.current_tx_id,
+            "op_type": "goal_update",
+            "payload": payload
+        }
+        self.send_tcp_message(msg, self.server_socket)
+
+    
 
 if __name__ == "__main__":
     client = PlatformClient()
     client.connect_servers()
-
+    client.active_input = True
     # Get user input
     while True:
+        if not client.running:
+            break
+        if not client.active_input:
+            time.sleep(0.1)
+            continue
+
         # time.sleep(1)
         print("\nCommand Options (Enter number):\n"
         "1. Start Timer\n"
         "2. Stop Timer\n"
         "3. Join Timer\n"
-        "4. Add Calendar Event\n"
-        "5. Update Goal\n"
-        
+        "4. Begin Transaction\n"
+        "5. List Transactions / Locks\n"
         "0. Exit\n")
-
-        #Commment out to allow for ticks...
-        client.active_input = True
         
 
         option = input("Select Option: ")
@@ -680,19 +771,52 @@ if __name__ == "__main__":
             client.join_timer(address)
 
         elif option == "4":
-            client.active_input = True
-            title = input("Title: ")
-            desc = input("Description: ")
-            time_str = input("Time (YYYY-MM-DD HH:MM): ")
-            client.add_calendar_event(title, desc, time_str)
-            client.active_input = False
+            # Begin a new transaction
+            client.begin_transaction()
+            while True:
+                print("\nTransaction Menu:\n"
+                      "1. Add Calendar Event \n"
+                      "2. Update Goal \n"
+                      "3. Commit Transaction\n"
+                      "4. Abort Transaction\n")
+                client.active_input = True
 
-        elif option == "5":
+                tx_option = input("Select an option: ")
+
+                if tx_option == "1":
+                    # Add calendar event within the current transaction
+                    title = input("Title: ")
+                    desc = input("Description: ")
+                    time_str = input("Time (YYYY-MM-DD HH:MM): ")
+                    client.active_input = False
+                    client.tx_add_calendar_event(title, desc, time_str)
+
+                elif tx_option == "2":
+                    # Update goal within the current transaction
+                    user = input("User: ")
+                    goal = input("Goal: ")
+                    finish = input("Completed? (y/n): ").strip().lower() == "y"
+                    client.active_input = False
+                    client.tx_update_goal(goal, user, finish)
+
+                elif tx_option == "3":
+                    # Commit and exit transaction menu
+                    client.commit_transaction()
+                    client.active_input = False
+                    break
+
+                elif tx_option == "4":
+                    # Abort and exit transaction menu
+                    client.abort_transaction()
+                    client.active_input = False
+                    break
+                
+                else:
+                    print("Invalid input...")
             client.active_input = True
-            user = input("User: ")
-            goal = input("Goal: ")
-            finish = input("Completed? (y/n): ").lower() == 'y'
-            client.update_goal(goal, user, finish)
+                
+        elif option == "5": 
+            client.request_tx_debug()
             client.active_input = False
 
         elif option == "0":
