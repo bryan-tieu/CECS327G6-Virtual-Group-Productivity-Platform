@@ -26,7 +26,7 @@ class PlatformServer:
         self.broadcast_q = Queue()
         self.clients_lock = threading.Lock()
 
-        self.transactions = {} # tx_id -> {"client": client_socket, "ops": [], "state": "active"}
+        self.transactions = {} 
         self.next_tx_id = 1
         self.locks = {} # resource key -> tx_id
         
@@ -51,6 +51,14 @@ class PlatformServer:
         self._sender_thread = threading.Thread(target=self._send_loop, daemon=True)
         self._sender_thread.start()
         
+        # Background cleanup
+        self.tx_timeout_seconds = 60
+        self._tx_cleanup_thread = threading.Thread(
+            target=self._cleanup_stale_transactions,
+            daemon=True,
+        )
+        self._tx_cleanup_thread.start()
+
         try:
             
             while True:
@@ -133,11 +141,21 @@ class PlatformServer:
             print(f"TCP Client {address} disconnected")
             
         finally:
-            
+            # Abort any active transactions belonging to this client
+            # (this covers normal disconnects AND crashes that result in socket close)
+            owned_tx_ids = [
+                tx_id
+                for tx_id, tx in list(self.transactions.items())
+                if tx["client"] is client_socket and tx["state"] == "active"
+            ]
+            for tx_id in owned_tx_ids:
+                # no need to notify: the client is already gone
+                self._abort_tx_internal(tx_id, reason="client_disconnect", notify_client=False)
+
             with self.clients_lock:
                 if client_socket in self.connected_clients:
                     self.connected_clients.remove(client_socket)
-                
+            
             client_socket.close()
             
     # TCP messsages
@@ -182,7 +200,8 @@ class PlatformServer:
         self.transactions[tx_id] = {
             "client": client_socket,
             "ops": [],
-            "state": "active"
+            "state": "active",
+            "last_activity": time.time(),
         }
 
         reply = {
@@ -270,11 +289,8 @@ class PlatformServer:
                 self.locks[resource_key] = tx_id
 
         # still active: record the operation for later commit
-        tx["ops"].append({
-            "op_type": op_type,
-            "payload": payload
-        })
-
+        tx["ops"].append({"op_type": op_type, "payload": payload})
+        tx["last_activity"] = time.time()
         reply = {"type": "tx_op_ok", "tx_id": tx_id}
         client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
 
@@ -336,23 +352,30 @@ class PlatformServer:
                 "completed": payload.get("completed", False)
         })
 
-
-    def _handle_tx_abort(self, message, client_socket):
-        tx_id = message.get("tx_id")
+    def _abort_tx_internal(self, tx_id, reason="client_abort", notify_client=True):
         tx = self.transactions.get(tx_id)
-
-        if not tx:
+        if not tx or tx["state"] != "active":
             return
 
         tx["state"] = "aborted"
 
-        # release locks
-        to_release = [key for key, owner in self.locks.items() if owner == tx_id]
+        # release locks held by this tx
+        to_release = [key for key, owner in list(self.locks.items()) if owner == tx_id]
         for key in to_release:
             del self.locks[key]
 
-        reply = {"type": "tx_aborted", "tx_id": tx_id, "reason": "client_abort"}
-        client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+        if notify_client:
+            client = tx["client"]
+            reply = {"type": "tx_aborted", "tx_id": tx_id, "reason": reason}
+            try:
+                client.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+            except OSError:
+                # client might already be gone
+                pass
+
+    def _handle_tx_abort(self, message, client_socket):
+        tx_id = message.get("tx_id")
+        self._abort_tx_internal(tx_id, reason="client_abort", notify_client=True)
 
     def _handle_tx_debug(self, message, client_socket):
         """
@@ -392,6 +415,29 @@ class PlatformServer:
         except Exception:
             # If the client disconnected between request and response, just drop it.
             pass
+    
+    
+    def _cleanup_stale_transactions(self):
+        check_interval = 5  # seconds between sweeps
+        while not self.shutdown_event.is_set():
+            now = time.time()
+            # make a snapshot list to avoid modifying the dict while iterating
+            for tx_id, tx in list(self.transactions.items()):
+                if tx.get("state") != "active":
+                    continue
+
+                last = tx.get("last_activity", now)
+                if now - last > self.tx_timeout_seconds:
+                    print(f"[TX {tx_id}] Timing out after {self.tx_timeout_seconds}s of inactivity")
+                    # Notify client if it’s still around
+                    self._abort_tx_internal(
+                        tx_id,
+                        reason="timeout",
+                        notify_client=True
+                    )
+
+            time.sleep(check_interval)
+
 
     # Timer state control
     def _handle_timer_control(self, message):
