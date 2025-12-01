@@ -270,6 +270,7 @@ class PlatformClient:
 
             sock.sendall(wire)
             msg_type = msg.get("type")
+            print(f"Sending {msg_type} to {sock}")
             if msg_type in ("tx_op", "tx_commit", "tx_abort"):
                 print(f"[TX {msg.get('tx_id')}] Sent {msg_type} (Lamport={msg['lamport']})")
         except Exception as e:
@@ -392,7 +393,8 @@ class PlatformClient:
                 lineage += child[1]
 
         msg = {"type": "sync_request",
-               "lineage": lineage}
+               "lineage": lineage,
+               "address": self.host}
         self.send_tcp_message(msg, self.sync_master)
         self.last_requested = time.time()
 
@@ -505,6 +507,8 @@ class PlatformClient:
                                      "time": self.time_left,
                                      "grandparent": self.sync_grandmaster}
                             self.send_tcp_message(reply, selected)
+                        else:
+                            print("Sync request received from non-child")
 
                     elif msg_type == "sync_update":
                         self.lamport_receive(message["lamport"])
@@ -669,7 +673,7 @@ class PlatformClient:
 
     def _join_request(self, applicant, applicant_sock):
         if len(self.children) < maximum_children:
-            parent_addr = self.sync_master_address if self.sync_master_address else self.host
+            parent_addr = self.sync_master_address #if self.sync_master_address else self.host
             reply = {"type": "confirm_join",
                      "parent_address": parent_addr}
             with self.children_lock:
