@@ -190,25 +190,25 @@ class PlatformClient:
         
         elif msg_type == "tx_started":
             self.current_tx_id = msg["tx_id"]
-            print(f"[TX] Began transaction {self.current_tx_id}")
+            self._print_tx_event(msg["tx_id"], "Began transaction")
 
         elif msg_type == "tx_op_ok":
-            print(f"[TX {msg['tx_id']}] Operation recorded")
+            self._print_tx_event(msg["tx_id"], "Operation recorded")
 
         elif msg_type == "tx_committed":
-            print(f"[TX {msg['tx_id']}] Commit successful")
+            self._print_tx_event(msg["tx_id"], "Commit successful")
             if self.current_tx_id == msg["tx_id"]:
                 self.current_tx_id = None
             self.active_input = True
 
         elif msg_type == "tx_aborted":
-            print(f"[TX {msg['tx_id']}] Aborted: {msg.get('reason')}")
+            self._print_tx_event(msg["tx_id"], "Aborted", msg.get("reason"))
             if self.current_tx_id == msg["tx_id"]:
                 self.current_tx_id = None
             self.active_input = True
 
         elif msg_type == "tx_error":
-            print(f"[TX {msg.get('tx_id')}] Error: {msg.get('reason')}")
+            self._print_tx_event(msg.get("tx_id"), "Error", msg.get("reason"))
             self.active_input = True
 
         elif msg_type == "tx_debug_info":
@@ -241,6 +241,21 @@ class PlatformClient:
         else:
             if self.active_input:
                 print(f"[Server] Message: {msg}")
+    def _print_tx_event(self, tx_id, status, reason=None):
+        """
+        Unified TX log format.
+        Example: [TX 2] Aborted: Reason: Calendar time ... already booked
+        """
+        if tx_id is None:
+            prefix = "[TX ?]"
+        else:
+            prefix = f"[TX {tx_id}]"
+
+        if reason:
+            print(f"{prefix} {status}: {reason}")
+        else:
+            print(f"{prefix} {status}")
+
 
     # TCP message
     def send_tcp_message(self, msg, sock):
@@ -253,8 +268,9 @@ class PlatformClient:
             # also prevent sending messages to anything other than children/server (except for disconnect_notice type)
 
             sock.sendall(wire)
-            if msg.get("type", "").startswith("tx_"):
-                print(f"→ TX[{msg['type']}:{msg.get('tx_id')}] (Lamport={msg['lamport']})")
+            msg_type = msg.get("type")
+            if msg_type in ("tx_op", "tx_commit", "tx_abort"):
+                print(f"[TX {msg.get('tx_id')}] Sent {msg_type} (Lamport={msg['lamport']})")
         except Exception as e:
             print(f"[Client] Error sending tcp message: {e}")
 

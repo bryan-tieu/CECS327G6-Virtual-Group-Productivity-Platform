@@ -258,11 +258,13 @@ class PlatformServer:
 
             # Uniqueness against COMMITTED events
             if self._is_time_slot_taken(time_str):
+                tx["last_error"] = "time_slot_taken"
+                tx["last_error_detail"] = f"Reason: Calendar time {time_str} is already booked by another user"
                 tx["state"] = "aborted"
                 reply = {
                     "type": "tx_aborted",
                     "tx_id": tx_id,
-                    "reason": "this time slot is already taken",
+                    "reason": tx["last_error_detail"],
                     "scheduled_time": time_str,
                 }
                 client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
@@ -274,11 +276,13 @@ class PlatformServer:
                     existing_op["op_type"] == "calendar_event"
                     and existing_op["payload"].get("scheduled_time") == time_str
                 ):
+                    tx["last_error"] = "duplicate_calendar_event"
+                    tx["last_error_detail"] = f"Reason: There is already a calendar event at {time_str} in this Transaction"
                     tx["state"] = "aborted"
                     reply = {
                         "type": "tx_aborted",
                         "tx_id": tx_id,
-                        "reason": "Someone already reserved this time slot before you moments ago",
+                        "reason": tx["last_error_detail"],
                         "scheduled_time": time_str,
                     }
                     client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
@@ -342,10 +346,13 @@ class PlatformServer:
         # --- Phase 1: local prepare ---
         if not self._prepare_tx_local(tx_id, local_ops):
             # Local prepare failed -> global abort
-            reason = tx.get("last_error_detail") or tx.get("last_error") or "2pc_local_prepare_failed"
-            print(f"[S1] Local prepare failed for TX {tx_id}: {reason}")
-            # This will send tx_aborted to the client
-            self._abort_tx_internal(tx_id, reason=reason, notify_client=True)
+            full_reason = self._build_tx_reason(
+                tx_id,
+                base="2pc_local_prepare_failed",
+                abort_reasons=None,
+            )
+            print(f"[{self.server_id}] TX {tx_id} ABORTED: {full_reason}")
+            self._abort_tx_internal(tx_id, reason=full_reason, notify_client=True)
             return
 
         votes = []
@@ -363,6 +370,10 @@ class PlatformServer:
                 votes.append(vote)
                 if vote != "commit":
                     r = reply.get("reason", "participant voted abort with no reason")
+                    abort_reasons.append(f"{peer_addr} voted abort: {r}")
+                    tx["last_error"] = "remote_abort"
+                    tx["last_error_detail"] = r
+
 
         if any(v != "commit" for v in votes):
             # Inform participants of global abort
@@ -370,13 +381,16 @@ class PlatformServer:
                 msg = {"type": "tx_decision", "tx_id": tx_id, "decision": "abort"}
                 self._send_2pc_message(peer_addr, msg, timeout=2.0)
 
-            # Build detailed reason
-            if abort_reasons:
-                full_reason = "2pc_global_abort: " + "; ".join(abort_reasons)
-            else:
-                full_reason = "2pc_global_abort"
+            # Prefer local stored detail, otherwise participant reasons, otherwise generic
+            detailed = tx.get("last_error_detail") or tx.get("last_error")
+            if not detailed and abort_reasons:
+                detailed = "; ".join(abort_reasons)
+            if not detailed:
+                detailed = "2pc_global_abort"
 
-            print(f"[{self.server_id}] 2PC global abort for TX {tx_id}: {full_reason}")
+            full_reason = detailed
+
+            print(f"[{self.server_id}] TX {tx_id} ABORTED (global 2PC): {full_reason}")
 
             # Single place that notifies the client
             self._abort_tx_internal(tx_id, reason=full_reason, notify_client=True)
@@ -488,7 +502,30 @@ class PlatformServer:
             # If the client disconnected between request and response, just drop it.
             pass
     
-    
+    def _build_tx_reason(self, tx_id, base=None, abort_reasons=None):
+        """
+        Build a human-readable reason string for logging and client messages.
+
+        - base: high-level label like "2pc_global_abort"
+        - abort_reasons: list of strings from remote participants (tx_vote.reason)
+        - tx.last_error_detail / tx.last_error: detailed local error, if any
+        """
+        tx = self.transactions.get(tx_id, {})
+        details = tx.get("last_error_detail") or tx.get("last_error")
+
+        parts = []
+        if base:
+            parts.append(base)
+        if details:
+            parts.append(details)
+        if abort_reasons:
+            parts.append("; ".join(abort_reasons))
+
+        if not parts:
+            return "unknown_transaction_error"
+
+        return " | ".join(parts)
+
     def _cleanup_stale_transactions(self):
         check_interval = 5  # Seconds between sweeps
         while not self.shutdown_event.is_set():
