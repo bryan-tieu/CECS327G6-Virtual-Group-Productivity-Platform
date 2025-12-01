@@ -26,7 +26,6 @@ def node_ports_available(tcp_port: int, udp_port: int) -> bool:
     return True
 
 def launch_distributed_servers():
-    """Launch S1 (coordinator), S2 (goals), S3 (calendar)"""
     servers = {}
     
     # S1 - Coordinator (port 8000)
