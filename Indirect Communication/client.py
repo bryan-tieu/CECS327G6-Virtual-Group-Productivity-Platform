@@ -158,7 +158,6 @@ class PlatformClient:
 
                         try:
                             message = json.loads(line.decode("utf-8"))
-                            #print("[CLIENT RAW MESSAGE]", message)
                             #Test (M4...)
                             if "lamport" in message:
                                 self.lamport_receive(message["lamport"])
@@ -200,14 +199,17 @@ class PlatformClient:
             print(f"[TX {msg['tx_id']}] Commit successful")
             if self.current_tx_id == msg["tx_id"]:
                 self.current_tx_id = None
+            self.active_input = True
 
         elif msg_type == "tx_aborted":
             print(f"[TX {msg['tx_id']}] Aborted: {msg.get('reason')}")
             if self.current_tx_id == msg["tx_id"]:
                 self.current_tx_id = None
+            self.active_input = True
 
         elif msg_type == "tx_error":
             print(f"[TX {msg.get('tx_id')}] Error: {msg.get('reason')}")
+            self.active_input = True
 
         elif msg_type == "tx_debug_info":
             print("\n--- Transaction Debug Info ---")
@@ -237,7 +239,8 @@ class PlatformClient:
             self.active_input = True
 
         else:
-            print(f"[Server] Message: {msg}")
+            if self.active_input:
+                print(f"[Server] Message: {msg}")
 
     # TCP message
     def send_tcp_message(self, msg, sock):
@@ -250,7 +253,8 @@ class PlatformClient:
             # also prevent sending messages to anything other than children/server (except for disconnect_notice type)
 
             sock.sendall(wire)
-            print(f"[Lamport={msg['lamport']}] Sent message {msg} to {sock}")
+            if msg.get("type", "").startswith("tx_"):
+                print(f"→ TX[{msg['type']}:{msg.get('tx_id')}] (Lamport={msg['lamport']})")
         except Exception as e:
             print(f"[Client] Error sending tcp message: {e}")
 
@@ -823,7 +827,9 @@ if __name__ == "__main__":
                 
                 else:
                     print("Invalid input...")
-            client.active_input = True
+
+            if client.current_tx_id is None:
+                client.active_input = True
                 
         elif option == "5": 
             client.request_tx_debug()

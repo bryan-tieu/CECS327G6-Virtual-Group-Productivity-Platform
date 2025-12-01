@@ -191,7 +191,6 @@ class PlatformServer:
                 return
         
         if msg_type == "tx_begin":
-            print("[SERVER] Received tx_begin")
             self._handle_tx_begin(message, client_socket)
 
         elif msg_type == "tx_op":
@@ -218,7 +217,7 @@ class PlatformServer:
         tx_id = self.next_tx_id
         self.next_tx_id += 1
 
-        print(f"[SERVER] Starting TX {tx_id} for client {client_socket.getpeername()}")
+        print(f"[SERVER] Starting Transaction {tx_id} for client {client_socket.getpeername()}")
 
         self.transactions[tx_id] = {
             "client": client_socket,
@@ -327,7 +326,7 @@ class PlatformServer:
             return
 
         all_ops = tx["ops"]
-        print(f"[S1] Starting 2PC for TX {tx_id}")
+        print(f"[{self.server_id}] Starting 2PC for TX {tx_id}")
 
         # --- Group ops by participant ---
         participants = {}  # Peer_addr -> [ops]
@@ -343,34 +342,46 @@ class PlatformServer:
         # --- Phase 1: local prepare ---
         if not self._prepare_tx_local(tx_id, local_ops):
             # Local prepare failed -> global abort
-            self._abort_tx_internal(tx_id, reason="2pc_local_prepare_failed")
-            reply = {"type": "tx_aborted", "tx_id": tx_id, "reason": "2pc_local_prepare_failed"}
-            client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+            reason = tx.get("last_error_detail") or tx.get("last_error") or "2pc_local_prepare_failed"
+            print(f"[S1] Local prepare failed for TX {tx_id}: {reason}")
+            # This will send tx_aborted to the client
+            self._abort_tx_internal(tx_id, reason=reason, notify_client=True)
             return
 
         votes = []
+        abort_reasons = []
         # --- Phase 1: remote prepare ---
         for peer_addr, ops in participants.items():
             msg = {"type": "tx_prepare", "tx_id": tx_id, "ops": ops}
             reply = self._send_2pc_message(peer_addr, msg, timeout=2.0)
+
             if not reply or reply.get("type") != "tx_vote":
                 votes.append("abort")
+                abort_reasons.append(f"{peer_addr} did not respond during prepare")
             else:
-                votes.append(reply.get("vote", "abort"))
+                vote = reply.get("vote", "abort")
+                votes.append(vote)
+                if vote != "commit":
+                    r = reply.get("reason", "participant voted abort with no reason")
 
         if any(v != "commit" for v in votes):
-            # Someone aborted or timed out -> global abort
+            # Inform participants of global abort
             for peer_addr in participants.keys():
-                try:
-                    msg = {"type": "tx_decision", "tx_id": tx_id, "decision": "abort"}
-                    self._send_2pc_message(peer_addr, msg, timeout=2.0)
-                except:
-                    pass
+                msg = {"type": "tx_decision", "tx_id": tx_id, "decision": "abort"}
+                self._send_2pc_message(peer_addr, msg, timeout=2.0)
 
-            self._abort_tx_internal(tx_id, reason="2pc_global_abort")
-            reply = {"type": "tx_aborted", "tx_id": tx_id, "reason": "2pc_global_abort"}
-            client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+            # Build detailed reason
+            if abort_reasons:
+                full_reason = "2pc_global_abort: " + "; ".join(abort_reasons)
+            else:
+                full_reason = "2pc_global_abort"
+
+            print(f"[{self.server_id}] 2PC global abort for TX {tx_id}: {full_reason}")
+
+            # Single place that notifies the client
+            self._abort_tx_internal(tx_id, reason=full_reason, notify_client=True)
             return
+
 
         # --- Phase 2: global commit ---
         # Tell remote participants to commit
@@ -740,16 +751,25 @@ class PlatformServer:
                 scheduled_time = payload.get("scheduled_time")
                 resource_key = f"calendar:{scheduled_time}"
                 if not scheduled_time:
+                    tx["last_error"] = "missing_scheduled_time"
+                    tx["last_error_detail"] = "calendar_event missing scheduled_time in prepare phase"
+                    print(f"[{self.server_id}] PREPARE fail TX {tx_id}: missing scheduled_time")
                     return False
 
                 # Committed uniqueness check
                 if self._is_time_slot_taken(scheduled_time):
+                    tx["last_error"] = "time_slot_taken"
+                    tx["last_error_detail"] = (f"Reason: Calendar time {scheduled_time} is already booked by another user")
+                    print(f"[{self.server_id}] PREPARE fail Transaction {tx_id}: scheduled time is already booked by another user")
                     return False
 
                 # Uniqueness inside this transaction
                 for existing_op in tx["ops"]:
-                    if existing_op["op_type"] == "calendar_event" and \
-                       existing_op["payload"].get("scheduled_time") == scheduled_time:
+                    if (existing_op["op_type"] == "calendar_event" and 
+                       existing_op["payload"].get("scheduled_time") == scheduled_time):
+                        tx["last_error"] = "duplicate_calendar_event"
+                        tx["last_error_detail"] = (f"Reason: There is already an calendar event at {scheduled_time} in this Transaction")
+                        print(f"[{self.server_id}] PREPARE fail Transaction {tx_id}: There is already an calendar event at {scheduled_time} in this Transaction")
                         return False
 
             elif op_type == "goal_update":
@@ -757,11 +777,17 @@ class PlatformServer:
                 goal = payload.get("goal")
                 resource_key = f"goal:{user}:{goal}"
             else:
+                tx["last_error"] = "unknown_op_type"
+                tx["last_error_detail"] = f"unknown op_type in prepare phase: {op_type}"
+                print(f"[{self.server_id}] PREPARE fail TX {tx_id}: unknown op_type {op_type}")
                 return False
 
             # Lock acquisition, same logic as in _handle_tx_op
             owner = self.locks.get(resource_key)
             if owner is not None and owner != tx_id:
+                tx["last_error"] = "lock_conflict"
+                tx["last_error_detail"] = (f"lock_conflict on {resource_key}, currently owned by TX {owner}")
+                print(f"[{self.server_id}] PREPARE fail TX {tx_id}: lock_conflict on {resource_key} owned by {owner}")
                 return False
             else:
                 self.locks[resource_key] = tx_id
@@ -807,26 +833,37 @@ class PlatformServer:
 
         # Ensure tx structure exists for this peer tx
         tx = self.transactions.get(tx_id)
-        if not tx:
-            # This tx is initiated by a remote coordinator; create skeleton
-            self.transactions[tx_id] = {
-                "client": None, 
+        if tx is None:
+            tx = {
+                "client": None,       # remote coordinator owns this tx
                 "ops": [],
                 "state": "active",
                 "last_activity": time.time(),
+                "last_error": None,
+                "last_error_detail": None,
             }
+            self.transactions[tx_id] = tx 
+
 
         ok = self._prepare_tx_local(tx_id, ops)
-        vote = "commit" if ok else "abort"
+        if ok:
+            vote = "commit"
+            vote_reason = None
+        else:
+            vote = "abort"
+            vote_reason = tx.get("last_error_detail") or tx.get("last_error") or "prepare_failed"
+
 
         reply = {"type": "tx_vote", "tx_id": tx_id, "vote": vote}
+        if vote_reason:
+            reply["reason"] = vote_reason 
         client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
 
         # If failing, clean up immediately
         if not ok:
-            self._abort_tx_internal(tx_id, reason="2pc_prepare_failed", notify_client=False)
+            self._abort_tx_internal(tx_id, reason=vote_reason, notify_client=False)
 
-        print(f"[S2] PREPARE for Transaction {tx_id}, ops={ops}")
+        print(f"[{self.server_id}] PREPARE for Transaction {tx_id}")
 
     def _handle_tx_decision(self, message, client_socket):
         """
@@ -843,9 +880,9 @@ class PlatformServer:
 
         reply = {"type": "tx_decision_ack", "tx_id": tx_id}
         client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
-        print(f"[S2] DECISION {decision} for Transaction {tx_id}")
+        print(f"[{self.server_id}] DECISION {decision} for Transaction {tx_id}")
 
-    def _pick_participant_for_op(self, op):
+    def _pick_participant_for_op(self, op): 
         """
         Coordinator-only: returns (host, port) of the server that should own this op,
         or None if the coordinator should handle it locally.
