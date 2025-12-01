@@ -270,7 +270,7 @@ class PlatformClient:
 
             sock.sendall(wire)
             msg_type = msg.get("type")
-            print(f"Sending {msg_type} to {sock}")
+            #print(f"Sending {msg_type} to {sock}")
             if msg_type in ("tx_op", "tx_commit", "tx_abort"):
                 print(f"[TX {msg.get('tx_id')}] Sent {msg_type} (Lamport={msg['lamport']})")
         except Exception as e:
