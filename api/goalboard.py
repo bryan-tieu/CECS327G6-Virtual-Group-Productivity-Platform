@@ -11,13 +11,11 @@ router = APIRouter(prefix="/goals", tags=["Group Goals"])
 _socket_server_instance = None
 
 def set_socket_server(server):
-    """Set the socket server instance - called by main.py"""
     global _socket_server_instance
     _socket_server_instance = server
     print(f"[Goalboard] Socket server set: {server.server_id if server else None}")
 
 def get_socket_server():
-    """Get socket server instance"""
     return _socket_server_instance
 
 # Models
