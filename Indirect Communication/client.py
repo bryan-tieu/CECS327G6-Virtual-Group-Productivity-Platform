@@ -194,6 +194,7 @@ class PlatformClient:
 
         elif msg_type == "tx_op_ok":
             self._print_tx_event(msg["tx_id"], "Operation recorded")
+            self.active_input = True
 
         elif msg_type == "tx_committed":
             self._print_tx_event(msg["tx_id"], "Commit successful")
@@ -804,6 +805,15 @@ if __name__ == "__main__":
                 continue
 
             while True:
+                while not client.active_input:
+                    if client.current_tx_id is None:
+                        print("\nTransaction is no longer active (aborted or timed out). Returning to main menu.")
+                        break
+                    time.sleep(0.05)
+                
+                if client.current_tx_id is None:
+                    break
+
                 print("\nTransaction Menu:\n"
                       "1. Add Calendar Event \n"
                       "2. Update Goal \n"
@@ -812,6 +822,7 @@ if __name__ == "__main__":
                 client.active_input = True
 
                 tx_option = input("Select an option: ")
+
 
                 if tx_option == "1":
                     # Add calendar event within the current transaction
