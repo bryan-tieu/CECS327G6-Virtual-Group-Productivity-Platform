@@ -134,7 +134,7 @@ class PlatformClient:
 
             with self.children_lock:
                 for child in self.children:
-                    if child[0] == address:
+                    if child[0] == address[0]:
                         self.children.remove(child)
                         break
 
@@ -341,6 +341,7 @@ class PlatformClient:
                     msg_type = message.get("type")
                     if msg_type == "confirm_join":
                         print("Join confirmed")
+                        self.time_left = default_timer_length  # this will be re-synced immediately
                         self.sync_grandmaster = message.get("parent_address")
                         self.timer_running = True
                         return
@@ -407,6 +408,8 @@ class PlatformClient:
         last_tick = None
         response_timer = 0
 
+        timer_display = 0
+
         while True:
             start_time = time.time()
             if self.timer_running:  # prevents thread from using resources if no timer is active
@@ -418,6 +421,15 @@ class PlatformClient:
                     if crash_suspected:
                         response_timer += current - last_tick
                 last_tick = time.time()
+
+                # crude timer display
+                if timer_display > 20:
+                    print(f"Time left: {self.time_left}")
+                    timer_display = 0
+                else:
+                    timer_display += 1
+
+
                 if self.time_left <= 0:
                     self.lamport_event()
                     print("Timer finished")
@@ -480,7 +492,7 @@ class PlatformClient:
                         break
 
                     msg_type = message.get("type")
-
+                    selected = None
                     if msg_type == "sync_request":
                         requester = message.get("address")
                         with self.children_lock:
@@ -540,7 +552,7 @@ class PlatformClient:
                     # retrieve message from inbox until none are left
                     try:
                         message = self.inbox.get(block=False, timeout=tick_rate)
-                        print(f"Reply: {message}")
+                        print(f"Processing: {message}")
                     except Empty:
                         # if we are attempting to join and wating on a response
                         if time.time() - self.last_sync > time_until_suspicion and self.sync_master is not None:
