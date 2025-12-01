@@ -8,7 +8,7 @@ from queue import Queue, Empty
 class PlatformServer:
     
     # Init
-    def __init__(self, host='localhost', tcp_port=8000, udp_port = 8001):
+    def __init__(self, host='localhost', tcp_port=8000, udp_port = 8001, peers = None, server_id = None, role = "coordinator"):
         self.host = host
         self.tcp_port = tcp_port
         self.udp_socket = None
@@ -30,6 +30,14 @@ class PlatformServer:
         self.next_tx_id = 1
         self.locks = {} # resource key -> tx_id
         
+        # 2PC Implementation
+        self.server_id = server_id or f"{host}:{tcp_port}"
+        self.peers = peers or []
+
+        self.handles_calendar = role in ("coordinator", "calendar")
+        self.handles_goals = role in ("coordinator", "goals")
+        self.is_coordinator = role in ("coordinator", "tx_only")
+
     # Starting the central server
     def start_server(self):
         
@@ -137,7 +145,7 @@ class PlatformServer:
                 message = json.loads(data.decode())
                 self._process_tcp_message(message, client_socket)
                 
-        except (ConnectionResetError, json.JSONDecodeError):
+        except (ConnectionResetError, ConnectionAbortedError, json.JSONDecodeError):
             print(f"TCP Client {address} disconnected")
             
         finally:
@@ -176,7 +184,13 @@ class PlatformServer:
         elif msg_type == "request_sync":
             self._send_sync_data(client_socket)
 
-        elif msg_type == "tx_begin":
+        elif msg_type in ("tx_begin", "tx_op", "tx_commit", "tx_abort", "tx_debug"):
+            if not self.is_coordinator:
+                reply = {"type": "error", "reason": "not_a_coordinator"}
+                client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+                return
+        
+        if msg_type == "tx_begin":
             self._handle_tx_begin(message, client_socket)
 
         elif msg_type == "tx_op":
@@ -191,11 +205,19 @@ class PlatformServer:
         elif msg_type == "tx_debug":
             self._handle_tx_debug(message, client_socket)
 
+        elif msg_type == "tx_prepare":
+            self._handle_tx_prepare(message, client_socket)
+
+        elif msg_type == "tx_decision":
+            self._handle_tx_decision(message, client_socket)
+
     
     # Transaction Helpers
     def _handle_tx_begin(self, message, client_socket):
         tx_id = self.next_tx_id
         self.next_tx_id += 1
+
+        print(f"[SERVER] Starting Transaction {tx_id} for client {client_socket.getpeername()}")
 
         self.transactions[tx_id] = {
             "client": client_socket,
@@ -222,7 +244,7 @@ class PlatformServer:
         op_type = message.get("op_type")
         payload = message.get("payload", {})
 
-        # define a resource key for locking
+        # Define a resource key for locking
         if op_type == "calendar_event":
             time_str = payload.get("scheduled_time")
             if not time_str:
@@ -236,11 +258,13 @@ class PlatformServer:
 
             # Uniqueness against COMMITTED events
             if self._is_time_slot_taken(time_str):
+                tx["last_error"] = "time_slot_taken"
+                tx["last_error_detail"] = f"Reason: Calendar time {time_str} is already booked by another user"
                 tx["state"] = "aborted"
                 reply = {
                     "type": "tx_aborted",
                     "tx_id": tx_id,
-                    "reason": "this time slot is already taken",
+                    "reason": tx["last_error_detail"],
                     "scheduled_time": time_str,
                 }
                 client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
@@ -252,11 +276,13 @@ class PlatformServer:
                     existing_op["op_type"] == "calendar_event"
                     and existing_op["payload"].get("scheduled_time") == time_str
                 ):
+                    tx["last_error"] = "duplicate_calendar_event"
+                    tx["last_error_detail"] = f"Reason: There is already a calendar event at {time_str} in this Transaction"
                     tx["state"] = "aborted"
                     reply = {
                         "type": "tx_aborted",
                         "tx_id": tx_id,
-                        "reason": "Someone already reserved this time slot before you moments ago",
+                        "reason": tx["last_error_detail"],
                         "scheduled_time": time_str,
                     }
                     client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
@@ -268,14 +294,14 @@ class PlatformServer:
             goal = payload.get("goal")
             resource_key = f"goal:{user}:{goal}"
         else:
-            # unknown op
+            # Unknown op
             resource_key = None
 
-        # simple locking: one owner per resource
+        # Simple locking: one owner per resource
         if resource_key:
             owner = self.locks.get(resource_key)
             if owner is not None and owner != tx_id:
-                # conflict -> abort this transaction
+                # Conflict -> abort this transaction
                 tx["state"] = "aborted"
                 reply = {
                     "type": "tx_aborted",
@@ -288,40 +314,102 @@ class PlatformServer:
             else:
                 self.locks[resource_key] = tx_id
 
-        # still active: record the operation for later commit
+        # Still active: record the operation for later commit
         tx["ops"].append({"op_type": op_type, "payload": payload})
         tx["last_activity"] = time.time()
         reply = {"type": "tx_op_ok", "tx_id": tx_id}
         client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
 
     def _handle_tx_commit(self, message, client_socket):
-        tx_id = message.get("tx_id")    
+        tx_id = message.get("tx_id")
         tx = self.transactions.get(tx_id)
-
-        if not tx or tx["state"] != "active":
+        
+        if not tx or tx["state"] not in ("active", "preparing"):
             reply = {"type": "tx_error", "tx_id": tx_id, "reason": "cannot_commit"}
             client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
             return
 
-        # apply all operations
-        for op in tx["ops"]:
-            op_type = op["op_type"]
-            payload = op["payload"]
+        all_ops = tx["ops"]
+        print(f"[{self.server_id}] Starting 2PC for TX {tx_id}")
 
-            if op_type == "calendar_event":
-                self._apply_calendar_tx(payload)
-            elif op_type == "goal_update":
-                self._apply_goal_tx(payload)
+        # --- Group ops by participant ---
+        participants = {}  # Peer_addr -> [ops]
+        local_ops = []
 
-        # release locks
-        to_release = [key for key, owner in self.locks.items() if owner == tx_id]
-        for key in to_release:
-            del self.locks[key]
+        for op in all_ops:
+            peer = self._pick_participant_for_op(op)
+            if peer is None:
+                local_ops.append(op)
+            else:
+                participants.setdefault(peer, []).append(op)
 
-        tx["state"] = "committed"
+        # --- Phase 1: local prepare ---
+        if not self._prepare_tx_local(tx_id, local_ops):
+            # Local prepare failed -> global abort
+            full_reason = self._build_tx_reason(
+                tx_id,
+                base="2pc_local_prepare_failed",
+                abort_reasons=None,
+            )
+            print(f"[{self.server_id}] TX {tx_id} ABORTED: {full_reason}")
+            self._abort_tx_internal(tx_id, reason=full_reason, notify_client=True)
+            return
 
+        votes = []
+        abort_reasons = []
+        # --- Phase 1: remote prepare ---
+        for peer_addr, ops in participants.items():
+            msg = {"type": "tx_prepare", "tx_id": tx_id, "ops": ops}
+            reply = self._send_2pc_message(peer_addr, msg, timeout=2.0)
+
+            if not reply or reply.get("type") != "tx_vote":
+                votes.append("abort")
+                abort_reasons.append(f"{peer_addr} did not respond during prepare")
+            else:
+                vote = reply.get("vote", "abort")
+                votes.append(vote)
+                if vote != "commit":
+                    r = reply.get("reason", "participant voted abort with no reason")
+                    abort_reasons.append(f"{peer_addr} voted abort: {r}")
+                    tx["last_error"] = "remote_abort"
+                    tx["last_error_detail"] = r
+
+
+        if any(v != "commit" for v in votes):
+            # Inform participants of global abort
+            for peer_addr in participants.keys():
+                msg = {"type": "tx_decision", "tx_id": tx_id, "decision": "abort"}
+                self._send_2pc_message(peer_addr, msg, timeout=2.0)
+
+            # Prefer local stored detail, otherwise participant reasons, otherwise generic
+            detailed = tx.get("last_error_detail") or tx.get("last_error")
+            if not detailed and abort_reasons:
+                detailed = "; ".join(abort_reasons)
+            if not detailed:
+                detailed = "2pc_global_abort"
+
+            full_reason = detailed
+
+            print(f"[{self.server_id}] TX {tx_id} ABORTED (global 2PC): {full_reason}")
+
+            # Single place that notifies the client
+            self._abort_tx_internal(tx_id, reason=full_reason, notify_client=True)
+            return
+
+
+        # --- Phase 2: global commit ---
+        # Tell remote participants to commit
+        for peer_addr in participants.keys():
+            msg = {"type": "tx_decision", "tx_id": tx_id, "decision": "commit"}
+            self._send_2pc_message(peer_addr, msg, timeout=2.0)
+
+        # Commit locally
+        self._commit_tx_local(tx_id)
+        
+        # Notify client
         reply = {"type": "tx_committed", "tx_id": tx_id}
         client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+
 
     def _apply_calendar_tx(self, incoming_event):
         with self.lock:
@@ -344,7 +432,6 @@ class PlatformServer:
         return False
 
     def _apply_goal_tx(self, payload):
-        # based on _handle_goal_update
         self._broadcast_tcp_message({
             "type": "goal_update",
                 "goal": payload.get("goal"),
@@ -354,12 +441,12 @@ class PlatformServer:
 
     def _abort_tx_internal(self, tx_id, reason="client_abort", notify_client=True):
         tx = self.transactions.get(tx_id)
-        if not tx or tx["state"] != "active":
+        if not tx or tx["state"] not in  ("active", "preparing"):
             return
 
         tx["state"] = "aborted"
 
-        # release locks held by this tx
+        # Release locks held by this transaction
         to_release = [key for key, owner in list(self.locks.items()) if owner == tx_id]
         for key in to_release:
             del self.locks[key]
@@ -370,7 +457,6 @@ class PlatformServer:
             try:
                 client.sendall((json.dumps(reply) + "\n").encode("utf-8"))
             except OSError:
-                # client might already be gone
                 pass
 
     def _handle_tx_abort(self, message, client_socket):
@@ -416,12 +502,35 @@ class PlatformServer:
             # If the client disconnected between request and response, just drop it.
             pass
     
-    
+    def _build_tx_reason(self, tx_id, base=None, abort_reasons=None):
+        """
+        Build a human-readable reason string for logging and client messages.
+
+        - base: high-level label like "2pc_global_abort"
+        - abort_reasons: list of strings from remote participants (tx_vote.reason)
+        - tx.last_error_detail / tx.last_error: detailed local error, if any
+        """
+        tx = self.transactions.get(tx_id, {})
+        details = tx.get("last_error_detail") or tx.get("last_error")
+
+        parts = []
+        if base:
+            parts.append(base)
+        if details:
+            parts.append(details)
+        if abort_reasons:
+            parts.append("; ".join(abort_reasons))
+
+        if not parts:
+            return "unknown_transaction_error"
+
+        return " | ".join(parts)
+
     def _cleanup_stale_transactions(self):
-        check_interval = 5  # seconds between sweeps
+        check_interval = 5  # Seconds between sweeps
         while not self.shutdown_event.is_set():
             now = time.time()
-            # make a snapshot list to avoid modifying the dict while iterating
+            # Make a snapshot list to avoid modifying the dict while iterating
             for tx_id, tx in list(self.transactions.items()):
                 if tx.get("state") != "active":
                     continue
@@ -632,7 +741,263 @@ class PlatformServer:
             
             try: self.udp_socket.close()
             except: pass
-                
+
+    # 2PC Helpers
+    def _send_2pc_message(self, peer_addr, message, timeout=2.0):
+        """Blocking, simple helper to send a JSON line to another PlatformServer and read one reply."""
+        host, port = peer_addr
+        try:
+            with socket.create_connection((host, port), timeout=timeout) as sock:
+                wire = (json.dumps(message) + "\n").encode("utf-8")
+                sock.sendall(wire)
+
+                buffer = b""
+                sock.settimeout(timeout)
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    buffer += chunk
+                    if b"\n" in buffer:
+                        line, _ = buffer.split(b"\n", 1)
+                        if not line:
+                            continue
+                        reply = json.loads(line.decode("utf-8"))
+                        return reply
+        except Exception as e:
+            print(f"[2PC] Error talking to peer {peer_addr}: {e}")
+            return None
+
+    def _prepare_tx_local(self, tx_id, ops):
+        """
+        Phase 1 for this server: validate + lock resources for these ops only.
+        Do NOT apply calendar/goal updates yet.
+        """
+        tx = self.transactions.get(tx_id)
+        if not tx or tx["state"] not in ("active", "preparing"):
+            return False
+
+        # Mark as preparing
+        tx["state"] = "preparing"
+
+        for op in ops:
+            op_type = op["op_type"]
+            payload = op["payload"]
+
+            if op_type == "calendar_event":
+                scheduled_time = payload.get("scheduled_time")
+                resource_key = f"calendar:{scheduled_time}"
+                if not scheduled_time:
+                    tx["last_error"] = "missing_scheduled_time"
+                    tx["last_error_detail"] = "calendar_event missing scheduled_time in prepare phase"
+                    print(f"[{self.server_id}] PREPARE fail TX {tx_id}: missing scheduled_time")
+                    return False
+
+                # Committed uniqueness check
+                if self._is_time_slot_taken(scheduled_time):
+                    tx["last_error"] = "time_slot_taken"
+                    tx["last_error_detail"] = (f"Reason: Calendar time {scheduled_time} is already booked by another user")
+                    print(f"[{self.server_id}] PREPARE fail Transaction {tx_id}: scheduled time is already booked by another user")
+                    return False
+
+                # Uniqueness inside this transaction
+                for existing_op in tx["ops"]:
+                    if (existing_op["op_type"] == "calendar_event" and 
+                       existing_op["payload"].get("scheduled_time") == scheduled_time):
+                        tx["last_error"] = "duplicate_calendar_event"
+                        tx["last_error_detail"] = (f"Reason: There is already an calendar event at {scheduled_time} in this Transaction")
+                        print(f"[{self.server_id}] PREPARE fail Transaction {tx_id}: There is already an calendar event at {scheduled_time} in this Transaction")
+                        return False
+
+            elif op_type == "goal_update":
+                user = payload.get("user")
+                goal = payload.get("goal")
+                resource_key = f"goal:{user}:{goal}"
+            else:
+                tx["last_error"] = "unknown_op_type"
+                tx["last_error_detail"] = f"unknown op_type in prepare phase: {op_type}"
+                print(f"[{self.server_id}] PREPARE fail TX {tx_id}: unknown op_type {op_type}")
+                return False
+
+            # Lock acquisition, same logic as in _handle_tx_op
+            owner = self.locks.get(resource_key)
+            if owner is not None and owner != tx_id:
+                tx["last_error"] = "lock_conflict"
+                tx["last_error_detail"] = (f"lock_conflict on {resource_key}, currently owned by TX {owner}")
+                print(f"[{self.server_id}] PREPARE fail TX {tx_id}: lock_conflict on {resource_key} owned by {owner}")
+                return False
+            else:
+                self.locks[resource_key] = tx_id
+
+        # Store ops as "prepared" (for this server)
+        tx["ops"] = ops
+        tx["last_activity"] = time.time()
+        return True
+
+    def _commit_tx_local(self, tx_id):
+        """
+        Phase 2 local commit: apply all prepared ops and release locks.
+        """
+        tx = self.transactions.get(tx_id)
+        if not tx or tx["state"] not in ("preparing", "prepared", "active"):
+            return False
+
+        # Actually apply
+        for op in tx["ops"]:
+            op_type = op["op_type"]
+            payload = op["payload"]
+            if op_type == "calendar_event":
+                self._apply_calendar_tx(payload)
+            elif op_type == "goal_update":
+                self._apply_goal_tx(payload)
+
+        # Release locks for this transaction
+        resources_to_release = [res for res, owner in self.locks.items() if owner == tx_id]
+        for res in resources_to_release:
+            del self.locks[res]
+
+        tx["state"] = "committed"
+        tx["last_activity"] = time.time()
+        return True
+
+    def _handle_tx_prepare(self, message, client_socket):
+        """
+        Participant side of phase 1.
+        message: { "type": "tx_prepare", "tx_id": int, "ops": [ ... ] }
+        """
+        tx_id = message.get("tx_id")
+        ops = message.get("ops", [])
+
+        # Ensure tx structure exists for this peer tx
+        tx = self.transactions.get(tx_id)
+        if tx is None:
+            tx = {
+                "client": None,       # remote coordinator owns this tx
+                "ops": [],
+                "state": "active",
+                "last_activity": time.time(),
+                "last_error": None,
+                "last_error_detail": None,
+            }
+            self.transactions[tx_id] = tx 
+
+
+        ok = self._prepare_tx_local(tx_id, ops)
+        if ok:
+            vote = "commit"
+            vote_reason = None
+        else:
+            vote = "abort"
+            vote_reason = tx.get("last_error_detail") or tx.get("last_error") or "prepare_failed"
+
+
+        reply = {"type": "tx_vote", "tx_id": tx_id, "vote": vote}
+        if vote_reason:
+            reply["reason"] = vote_reason 
+        client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+
+        # If failing, clean up immediately
+        if not ok:
+            self._abort_tx_internal(tx_id, reason=vote_reason, notify_client=False)
+
+        print(f"[{self.server_id}] PREPARE for Transaction {tx_id}")
+
+    def _handle_tx_decision(self, message, client_socket):
+        """
+        Participant side of phase 2.
+        message: { "type": "tx_decision", "tx_id": int, "decision": "commit"|"abort" }
+        """
+        tx_id = message.get("tx_id")
+        decision = message.get("decision")
+
+        if decision == "commit":
+            self._commit_tx_local(tx_id)
+        else:
+            self._abort_tx_internal(tx_id, reason="2pc_global_abort", notify_client=False)
+
+        reply = {"type": "tx_decision_ack", "tx_id": tx_id}
+        client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+        print(f"[{self.server_id}] DECISION {decision} for Transaction {tx_id}")
+
+    def _pick_participant_for_op(self, op): 
+        """
+        Coordinator-only: returns (host, port) of the server that should own this op,
+        or None if the coordinator should handle it locally.
+        """
+        if not self.peers or not self.is_coordinator:
+            return None
+
+        op_type = op["op_type"]
+        payload = op["payload"]
+
+        if op_type == "calendar_event":
+            # Send all calendar ops to S3
+            return ("localhost", 8200)
+        elif op_type == "goal_update":
+            # Send all goal ops to S2
+            return ("localhost", 8100)
+
+        # fallback: coordinator handles it
+        return None
+
+
+def node_ports_available(tcp_port: int, udp_port: int) -> bool:
+    # Check TCP
+    tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        tcp_sock.bind(("localhost", tcp_port))
+    except OSError:
+        tcp_sock.close()
+        return False
+    tcp_sock.close()
+
+    # Check UDP
+    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        udp_sock.bind(("localhost", udp_port))
+    except OSError:
+        udp_sock.close()
+        return False
+    udp_sock.close()
+
+    return True
+                    
 if __name__ == "__main__":
-    server = PlatformServer()
+    if node_ports_available(8000, 8001):
+        print("Launching Coordinator on 8000")
+        server = PlatformServer(
+            host="localhost",
+            tcp_port=8000,
+            udp_port=8001,
+            server_id="S1",
+            role="coordinator",
+            peers=[("localhost", 8100), ("localhost", 8200)],
+        )
+
+    elif node_ports_available(8100, 8101):
+        print("Launching Goals Node on 8100")
+        server = PlatformServer(
+            host="localhost",
+            tcp_port=8100,
+            udp_port=8101,
+            server_id="S2",
+            role="goals",
+            peers=[("localhost", 8000)],
+        )
+
+    elif node_ports_available(8200, 8201):
+        print("Launching Calendar Node on 8200")
+        server = PlatformServer(
+            host="localhost",
+            tcp_port=8200,
+            udp_port=8201,
+            server_id="S3",
+            role="calendar",
+            peers=[("localhost", 8000)],
+        )
+
+    else:
+        print("All servers are already running")
+        exit()
+
     server.start_server()

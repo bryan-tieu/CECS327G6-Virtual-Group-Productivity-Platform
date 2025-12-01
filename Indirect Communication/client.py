@@ -190,23 +190,27 @@ class PlatformClient:
         
         elif msg_type == "tx_started":
             self.current_tx_id = msg["tx_id"]
-            print(f"[TX] Began transaction {self.current_tx_id}")
+            self._print_tx_event(msg["tx_id"], "Began transaction")
 
         elif msg_type == "tx_op_ok":
-            print(f"[TX {msg['tx_id']}] Operation recorded")
+            self._print_tx_event(msg["tx_id"], "Operation recorded")
+            self.active_input = True
 
         elif msg_type == "tx_committed":
-            print(f"[TX {msg['tx_id']}] Commit successful")
+            self._print_tx_event(msg["tx_id"], "Commit successful")
             if self.current_tx_id == msg["tx_id"]:
                 self.current_tx_id = None
+            self.active_input = True
 
         elif msg_type == "tx_aborted":
-            print(f"[TX {msg['tx_id']}] Aborted: {msg.get('reason')}")
+            self._print_tx_event(msg["tx_id"], "Aborted", msg.get("reason"))
             if self.current_tx_id == msg["tx_id"]:
                 self.current_tx_id = None
+            self.active_input = True
 
         elif msg_type == "tx_error":
-            print(f"[TX {msg.get('tx_id')}] Error: {msg.get('reason')}")
+            self._print_tx_event(msg.get("tx_id"), "Error", msg.get("reason"))
+            self.active_input = True
 
         elif msg_type == "tx_debug_info":
             print("\n--- Transaction Debug Info ---")
@@ -236,7 +240,23 @@ class PlatformClient:
             self.active_input = True
 
         else:
-            print(f"[Server] Message: {msg}")
+            if self.active_input:
+                print(f"[Server] Message: {msg}")
+    def _print_tx_event(self, tx_id, status, reason=None):
+        """
+        Unified TX log format.
+        Example: [TX 2] Aborted: Reason: Calendar time ... already booked
+        """
+        if tx_id is None:
+            prefix = "[TX ?]"
+        else:
+            prefix = f"[TX {tx_id}]"
+
+        if reason:
+            print(f"{prefix} {status}: {reason}")
+        else:
+            print(f"{prefix} {status}")
+
 
     # TCP message
     def send_tcp_message(self, msg, sock):
@@ -249,7 +269,9 @@ class PlatformClient:
             # also prevent sending messages to anything other than children/server (except for disconnect_notice type)
 
             sock.sendall(wire)
-            print(f"[Lamport={msg['lamport']}] Sent message {msg} to {sock}")
+            msg_type = msg.get("type")
+            if msg_type in ("tx_op", "tx_commit", "tx_abort"):
+                print(f"[TX {msg.get('tx_id')}] Sent {msg_type} (Lamport={msg['lamport']})")
         except Exception as e:
             print(f"[Client] Error sending tcp message: {e}")
 
@@ -773,7 +795,25 @@ if __name__ == "__main__":
         elif option == "4":
             # Begin a new transaction
             client.begin_transaction()
+
+            start_wait = time.time()
+            while client.current_tx_id is None and time.time() - start_wait < 2:
+                time.sleep(0.05)
+
+            if client.current_tx_id is None:
+                print("Failed to start transaction (no response from server).")
+                continue
+
             while True:
+                while not client.active_input:
+                    if client.current_tx_id is None:
+                        print("\nTransaction is no longer active (aborted or timed out). Returning to main menu.")
+                        break
+                    time.sleep(0.05)
+                
+                if client.current_tx_id is None:
+                    break
+
                 print("\nTransaction Menu:\n"
                       "1. Add Calendar Event \n"
                       "2. Update Goal \n"
@@ -782,6 +822,7 @@ if __name__ == "__main__":
                 client.active_input = True
 
                 tx_option = input("Select an option: ")
+
 
                 if tx_option == "1":
                     # Add calendar event within the current transaction
@@ -813,7 +854,9 @@ if __name__ == "__main__":
                 
                 else:
                     print("Invalid input...")
-            client.active_input = True
+
+            if client.current_tx_id is None:
+                client.active_input = True
                 
         elif option == "5": 
             client.request_tx_debug()
