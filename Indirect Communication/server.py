@@ -260,14 +260,7 @@ class PlatformServer:
             if self._is_time_slot_taken(time_str):
                 tx["last_error"] = "time_slot_taken"
                 tx["last_error_detail"] = f"Reason: Calendar time {time_str} is already booked by another user"
-                tx["state"] = "aborted"
-                reply = {
-                    "type": "tx_aborted",
-                    "tx_id": tx_id,
-                    "reason": tx["last_error_detail"],
-                    "scheduled_time": time_str,
-                }
-                client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+                self._abort_tx_internal(tx_id, reason=tx["last_error_detail"], notify_client=True)
                 return
 
             # Uniqueness inside THIS transaction (same tx adding same time twice)
@@ -278,14 +271,7 @@ class PlatformServer:
                 ):
                     tx["last_error"] = "duplicate_calendar_event"
                     tx["last_error_detail"] = f"Reason: There is already a calendar event at {time_str} in this Transaction"
-                    tx["state"] = "aborted"
-                    reply = {
-                        "type": "tx_aborted",
-                        "tx_id": tx_id,
-                        "reason": tx["last_error_detail"],
-                        "scheduled_time": time_str,
-                    }
-                    client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+                    self._abort_tx_internal(tx_id, reason=tx["last_error_detail"], notify_client=True)
                     return
 
             resource_key = f"calendar:{time_str}"
@@ -302,14 +288,9 @@ class PlatformServer:
             owner = self.locks.get(resource_key)
             if owner is not None and owner != tx_id:
                 # Conflict -> abort this transaction
-                tx["state"] = "aborted"
-                reply = {
-                    "type": "tx_aborted",
-                    "tx_id": tx_id,
-                    "reason": "lock_conflict",
-                    "resource": resource_key
-                }
-                client_socket.sendall((json.dumps(reply) + "\n").encode("utf-8"))
+                tx["last_error"] = "lock_conflict"
+                tx["last_error_detail"] = (f"lock_conflict on {resource_key}, currently owned by TX {owner}")
+                self._abort_tx_internal(tx_id, reason=tx["last_error_detail"], notify_client=True)
                 return
             else:
                 self.locks[resource_key] = tx_id
