@@ -158,6 +158,7 @@ class PlatformClient:
 
                         try:
                             message = json.loads(line.decode("utf-8"))
+                            #print("[CLIENT RAW MESSAGE]", message)
                             #Test (M4...)
                             if "lamport" in message:
                                 self.lamport_receive(message["lamport"])
@@ -773,6 +774,15 @@ if __name__ == "__main__":
         elif option == "4":
             # Begin a new transaction
             client.begin_transaction()
+
+            start_wait = time.time()
+            while client.current_tx_id is None and time.time() - start_wait < 2:
+                time.sleep(0.05)
+
+            if client.current_tx_id is None:
+                print("Failed to start transaction (no response from server).")
+                continue
+
             while True:
                 print("\nTransaction Menu:\n"
                       "1. Add Calendar Event \n"
