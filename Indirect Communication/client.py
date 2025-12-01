@@ -56,6 +56,8 @@ class PlatformClient:
         tcp_thread = threading.Thread(target=self._start_p2p_server, daemon=True)
         tcp_thread.start()
 
+        self.phase = "Focus"
+        
     def connect_servers(self):
         # Attempt server connection
         try:
@@ -235,6 +237,35 @@ class PlatformClient:
             print("--- End Transaction Debug Info ---")
             self.active_input = True
 
+        elif msg_type == "2PC_Prepare":
+            tx_id = msg["tx_id"]
+            new_phase = msg["new_phase"]
+            
+            print("Phase change to {new_phase} requested.")
+            
+            vote = "commit"
+            
+            vote_message = {
+                "type": "2PC_Vote",
+                "tx_id": tx_id,
+                "vote": vote,
+                "new_phase": new_phase
+            }
+            
+            self.send_tcp_message(vote_message)
+        
+        elif msg_type == "2PC_Decision":
+            decision = msg["decision"]
+            new_phase = msg["new_phase"]
+            
+            print(f"Decision: {decision} for {new_phase}")
+            
+            if decision == "commit":
+                self.phase = new_phase
+                print(f"Phase updated to {self.phase}")
+            
+            else:
+                print(f"Phase change aborted. Staying in {self.phase}")
         else:
             print(f"[Server] Message: {msg}")
 
@@ -734,7 +765,15 @@ class PlatformClient:
         }
         self.send_tcp_message(msg, self.server_socket)
 
-    
+    def request_phase_change(self):
+        
+        new_phase = input("Enter new phase [Focus/Break]: ").strip()
+        message = {
+            "type": "request_phase_change",
+            "new_phase": new_phase
+        }
+        
+        self.send_tcp_message(message)
 
 if __name__ == "__main__":
     client = PlatformClient()

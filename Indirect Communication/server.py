@@ -2,6 +2,7 @@ import socket
 import threading
 import json
 import time
+import uuid
 from datetime import datetime
 from queue import Queue, Empty
 
@@ -29,6 +30,11 @@ class PlatformServer:
         self.transactions = {} 
         self.next_tx_id = 1
         self.locks = {} # resource key -> tx_id
+        
+        # 2pc
+        self.current_phase = "Focus"
+        self.in_progress_2pc = None 
+        self.in_progress_2pc_lock = threading.Lock()
         
     # Starting the central server
     def start_server(self):
@@ -69,6 +75,102 @@ class PlatformServer:
             print("\nKeyboard input detected.\nStopping server...")
             self._stop_server() 
     
+    # initialize 2pc phase changes
+    def start_2pc_phase_change(self, new_phase, timeout=4.0):
+        with self.clients_lock:
+            participants = list(self.connected_clients)
+        
+        if not participants:
+            print("No participants. Switching phase")
+            self.current_phase = new_phase
+            return 
+        
+        tx_id = str(uuid.uuid4())
+        
+        with self.in_progress_2pc_lock:
+            
+            self.ongoing_2pc = {
+                "tx_id": tx_id,
+                "new_phase": new_phase,
+                "votes": {p: None for p in participants},
+                "timeout": timeout,
+            }
+            
+        print(f"Starting phase change to {new_phase}")
+        
+        prepare_message = {
+            "type": "2PC_Prepare",
+            "tx_id": tx_id,
+            "new_phase": new_phase,
+        }
+        
+        self.broadcast_q.put(prepare_message)
+        
+        t = threading.Thread(target=self._wait_for_2pc_votes, args=(tx_id))
+        t.daemon = True
+        t.start()
+              
+    # helper for 2pc votes
+    def _wait_for_2pc_votes(self, tx_id):
+        start = time.time()
+        decision = "abort"
+
+        while True:
+            
+            with self.ongoing_2pc_lock:
+                
+                tx = self.ongoing_2pc
+                
+                if tx is None or tx["tx_id"] != tx_id:
+                    return 
+
+                votes = tx["votes"]
+
+                if any(v == "abort" for v in votes.values()):
+                    decision = "abort"
+                    break
+                
+                if all(v is not None for v in votes.values()):
+                    decision = "commit"
+                    break
+
+                remaining = tx["timeout"] - (time.time() - start)
+                
+                if remaining <= 0:
+                    
+                    print("[2PC] Timeout waiting for votes, aborting.")
+                    decision = "abort"
+                    break
+
+            time.sleep(0.05)
+
+        with self.ongoing_2pc_lock:
+            
+            tx = self.ongoing_2pc
+            
+            if tx is None or tx["tx_id"] != tx_id:
+                return
+            
+            new_phase = tx["new_phase"]
+            self.ongoing_2pc = None
+
+        if decision == "commit":
+            self.current_phase = new_phase
+            print(f"Committing phase change to {new_phase}")
+            
+        else:
+            print("Aborting phase change")
+
+        decision_message = {
+            "type": "2PC_Decision",
+            "tx_id": tx_id,
+            "decision": decision,
+            "new_phase": new_phase,
+        }
+        
+        self.broadcast_q.put(decision_message)
+    
+            
     # TCP helper
     def _start_tcp_server(self):
         
@@ -191,7 +293,31 @@ class PlatformServer:
         elif msg_type == "tx_debug":
             self._handle_tx_debug(message, client_socket)
 
-    
+        elif msg_type == "2pc_vote":
+            self._handle_2pc_vote(client_socket, message)
+
+        elif msg_type == "requested_phase_change":
+            new_phase = message.get("new_phase", "Focus")
+            self.start_2pc_phase_change(new_phase)
+            
+    # 2pc voting helper
+    def _handle_2pc_vote(self, client_socket, message):
+        tx_id = message.get("tx_id")
+        vote = message.get("vote")
+        
+        with self.in_progress_2pc_lock:
+            tx = self.in_progress_2pc
+            
+            if not tx or tx["tx_id"] != tx_id:
+                print("Incorrect transasction")
+                return
+
+            if client_socket not in tx["votes"]:
+                print("Invalid vote")
+                return
+
+            tx["votes"][client_socket] = vote
+            
     # Transaction Helpers
     def _handle_tx_begin(self, message, client_socket):
         tx_id = self.next_tx_id
