@@ -1,17 +1,26 @@
-# api/goalboard.py
 import threading
 from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel
 from typing import Dict, List, Optional
 from datetime import datetime
 
-from server import PlatformServer
 from pubsub import publish
 
 router = APIRouter(prefix="/goals", tags=["Group Goals"])
-socket_server: PlatformServer = None
 
-# --- Models ---
+_socket_server_instance = None
+
+def set_socket_server(server):
+    """Set the socket server instance - called by main.py"""
+    global _socket_server_instance
+    _socket_server_instance = server
+    print(f"[Goalboard] Socket server set: {server.server_id if server else None}")
+
+def get_socket_server():
+    """Get socket server instance"""
+    return _socket_server_instance
+
+# Models
 class Goal(BaseModel):
     id: str
     title: str
@@ -26,17 +35,14 @@ class GoalUpdate(BaseModel):
     description: Optional[str] = None
     completed: Optional[bool] = None
 
-
-# --- In-memory storage ---
+# Storage
 DB_GOALS: Dict[str, Goal] = {}
 DB_LOCK = threading.Lock()
 
-
-# --- Routes ---
+# Routes
 @router.get("/", response_model=List[Goal])
 def list_goals():
     return list(DB_GOALS.values())
-
 
 @router.get("/{goal_id}", response_model=Goal)
 def get_goal(goal_id: str):
@@ -44,21 +50,27 @@ def get_goal(goal_id: str):
         raise HTTPException(404, "Goal not found")
     return DB_GOALS[goal_id]
 
-
 @router.post("/", response_model=Goal, status_code=201)
 def create_goal(goal: Goal):
+    server = get_socket_server()
+    
     with DB_LOCK:
         if goal.id in DB_GOALS:
             raise HTTPException(409, "Goal ID already exists")
         DB_GOALS[goal.id] = goal
 
-    socket_server._broadcast_tcp_message({
-        "type": "goal_update",
-        "action": "create",
-        "goal": goal.model_dump(),
-        "all_goals": [g.model_dump() for g in DB_GOALS.values()],
-        "timestamp": datetime.now().isoformat()
-    })
+    if server:
+        try:
+            server._broadcast_tcp_message({
+                "type": "goal_update",
+                "action": "create",
+                "goal": goal.model_dump(),
+                "all_goals": [g.model_dump() for g in DB_GOALS.values()],
+                "timestamp": datetime.now().isoformat()
+            })
+        except Exception as e:
+            print(f"[Goalboard] Broadcast failed: {e}")
+
     publish("goal_updates", {
         "type": "goal_update",
         "action": "create",
@@ -69,10 +81,10 @@ def create_goal(goal: Goal):
 
     return goal
 
-
 @router.patch("/{goal_id}", response_model=Goal)
 def update_goal(goal_id: str, update: GoalUpdate):
-    """Edit or mark a goal as completed."""
+    server = get_socket_server()
+    
     with DB_LOCK:
         if goal_id not in DB_GOALS:
             raise HTTPException(404, "Goal not found")
@@ -81,13 +93,17 @@ def update_goal(goal_id: str, update: GoalUpdate):
         goal["updated_at"] = datetime.now()
         DB_GOALS[goal_id] = Goal(**goal)
 
-    socket_server._broadcast_tcp_message({
-        "type": "goal_update",
-        "action": "update",
-        "goal": DB_GOALS[goal_id].model_dump(),
-        "all_goals": [g.model_dump() for g in DB_GOALS.values()],
-        "timestamp": datetime.now().isoformat(),
-    })
+    if server:
+        try:
+            server._broadcast_tcp_message({
+                "type": "goal_update",
+                "action": "update",
+                "goal": DB_GOALS[goal_id].model_dump(),
+                "all_goals": [g.model_dump() for g in DB_GOALS.values()],
+                "timestamp": datetime.now().isoformat(),
+            })
+        except Exception as e:
+            print(f"[Goalboard] Broadcast failed: {e}")
 
     publish("goal_updates", {
         "type": "goal_update",
@@ -98,23 +114,28 @@ def update_goal(goal_id: str, update: GoalUpdate):
     })
     return DB_GOALS[goal_id]
 
-
 @router.delete("/{goal_id}", status_code=204)
 def delete_goal(goal_id: str):
+    server = get_socket_server()
+    
     with DB_LOCK:
         if goal_id not in DB_GOALS:
             raise HTTPException(404, "Goal not found")
         deleted = DB_GOALS[goal_id]
         del DB_GOALS[goal_id]
 
+    if server:
+        try:
+            server._broadcast_tcp_message({
+                "type": "goal_delete",
+                "action": "delete",
+                "goal": deleted.model_dump(),
+                "all_goals": [g.model_dump() for g in DB_GOALS.values()],
+                "timestamp": datetime.now().isoformat(),
+            })
+        except Exception as e:
+            print(f"[Goalboard] Broadcast failed: {e}")
 
-    socket_server._broadcast_tcp_message({
-        "type": "goal_delete",
-        "action": "delete",
-        "goal": deleted.model_dump(),
-        "all_goals": [g.model_dump() for g in DB_GOALS.values()],
-        "timestamp": datetime.now().isoformat(),
-    })
     publish("goal_updates", {
         "type": "goal_delete",
         "action": "delete",
