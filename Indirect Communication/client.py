@@ -99,8 +99,10 @@ class PlatformClient:
 
             while True:
 
-                data = client_socket.recv(1024)
-
+                try:
+                    data = client_socket.recv(1024)
+                except socket.timeout:
+                    continue
                 if not data:
                     break
                 buffer += data
@@ -111,11 +113,11 @@ class PlatformClient:
                         continue
 
                     message = json.loads(line.decode("utf-8"))
-
+                    #print(message)
                     #Test (M4...)
                     if "lamport" in message:
                         self.lamport_receive(message["lamport"])
-                        print(f"[Lamport={self.lamport_clock}] Updated clock from message")
+                        #print(f"[Lamport={self.lamport_clock}] Updated clock from message")
 
                     #print(f"Message received from {address}: {message}")
                     #self.inbox.put(message)
@@ -127,7 +129,7 @@ class PlatformClient:
                     else:
                         self.inbox.put(message)
 
-        except (ConnectionResetError, json.JSONDecodeError):
+        except (ConnectionResetError, ConnectionAbortedError, json.JSONDecodeError):
             print(f"TCP Client {address} disconnected")
 
         finally:
@@ -137,8 +139,8 @@ class PlatformClient:
                     if child[0] == address[0]:
                         self.children.remove(child)
                         break
-
-            client_socket.close()
+            if client_socket is not None:
+                client_socket.close()
 
     def tcp_listener(self):
         # Wait and listen for message from central server
@@ -345,6 +347,10 @@ class PlatformClient:
                         self.time_left = default_timer_length  # this will be re-synced immediately
                         self.sync_grandmaster = message.get("parent_address")
                         self.timer_running = True
+                        time.sleep(1)
+                        t = threading.Thread(target=self._handle_p2p_client, args=(self.sync_master, self.sync_master_address), daemon=True)
+
+                        t.start()
                         return
                     elif msg_type == "deny_join":
                         print("Join denied... trying another")
@@ -442,7 +448,7 @@ class PlatformClient:
                     if time.time() - self.last_sync > time_until_suspicion:
                         crash_suspected = True
                         self.lamport_event()
-                    else:
+                    elif time.time() - self.last_sync > tick_rate * 5: # requests a sync once every 5 ticks
                         self._request_sync()
 
                 # this is also where we do failure handling
@@ -515,7 +521,7 @@ class PlatformClient:
                         self.lamport_event()
                         received = time.time()
                         try:
-                            self.time_left = (received - self.last_requested)/2  # uses Cristian's Method for syncing
+                            self.time_left = message.get("time") - (received - self.last_requested)/2  # uses Cristian's Method for syncing
                             self.sync_grandmaster = message.get("grandparent")
                         except TypeError:
                             print("Syncing error: Update was received without being requested")
@@ -867,7 +873,7 @@ if __name__ == "__main__":
                     client.abort_transaction()
                     client.active_input = False
                     break
-                
+
                 else:
                     print("Invalid input...")
 
