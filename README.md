@@ -1,267 +1,172 @@
+# GroupSync - Virtual Group Productivity Platform
 
-# CECS327G6---Virtual-Group-Productivity-Platform
+A distributed system for collaborative productivity with synchronized calendars, shared goals, and P2P Pomodoro timers. Built for CECS 327 at CSULB.
 
-A real-time social productivity platform that allows remote users to synchronously follow a central pomodoro timer, share calendars, and track group goals. Built with a hybrid distributed architecture combining TCP/UDP sockets, REST APIs, and Redis Pub/Sub messaging.
+Team: Rebecca Mejia, Emmanuel Moye, Tin Nguyen, Bryan Tieu, Cole Triplett
+
+Course: CECS 327 - Introduction to Networks and Distributed Computing
+
+Instructor: Dr. Oscar Morales Ponce
+
 
 ## Quick Start
 
-### System Requirements
-- **Python**: 3.8+
-- **Redis Server**: 5.0+
-- **Network**: Ports 8000 (HTTP), 9000 (TCP), 9001 (UDP) available
+### Prerequisites
+- Python 3.8+
+- Redis server
 
-### 1. Install Dependencies
+### Installation & Running
 ```bash
-pip install fastapi uvicorn redis pydantic requests
-```
+# Install dependencies
+pip install fastapi uvicorn redis pydantic
 
-### 2. Start Redis Server
-```bash
-# On Ubuntu/Debian
-sudo systemctl start redis-server
-
-# Or run directly
+# Start Redis
 redis-server
-```
 
-### 3. Run the Complete System
-```bash
-# Start the FastAPI server (includes socket server and pub/sub)
+# Start the system
 python main.py
+# Server starts at http://localhost:8000
 
-# Or use uvicorn directly
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+# Start a client (in separate terminal)
+python client.py
 ```
 
-### 4. Verify System Status
+### Verify Installation
 ```bash
-# Check if servers are running
 curl http://localhost:8000/health
 ```
 
-## Test Cases & Verification
+---
 
-### API Endpoint Tests
+## Project Overview
 
-#### 1. Pomodoro Timer Tests
+Remote teams lack integrated productivity tools. Existing solutions operate separately, requiring manual coordination. GroupSync provides unified real-time collaboration.
+
+### Architecture: Hybrid Model
+- **Client-Server**: Calendar, goals, REST API (port 8000)
+- **Peer-to-Peer**: Timer synchronization, real-time updates
+- **Specialized Nodes**: Coordinator (8000), Goals (8100), Calendar (8200)
+
+### Distributed System Characteristics
+| Characteristic | Implementation |
+|----------------|----------------|
+| Heterogeneity | CLI clients, REST API, cross-platform |
+| Concurrency | Threading with locks for shared resources |
+| Scalability | Horizontal scaling with specialized nodes |
+| Failure Handling | P2P leader election, 2PC transactions |
+| Transparency | Users unaware of node distribution |
+| Openness | REST API for external integration |
+
+### Networking Protocols
+- **TCP** (port 8000): Reliable transactions, 2PC coordination
+- **UDP** (port 8001): Efficient timer tick broadcasts
+- **HTTP/REST**: Web client API
+- **Redis Pub/Sub**: Decoupled event broadcasting
+
+---
+
+## API Reference
+
+### Calendar (/events)
 ```bash
-# Get current timer state
-curl http://localhost:8000/pomo/state
-
-# Start the timer
-curl -X POST http://localhost:8000/pomo/start
-
-# Set timer to 15 minutes
-curl -X POST "http://localhost:8000/pomo/set?duration_minutes=15"
-```
-
-#### 2. Calendar Management Tests
-```bash
-# Create a new event
+# Create event
 curl -X POST http://localhost:8000/events/ \
   -H "Content-Type: application/json" \
-  -d '{
-    "id": "event1",
-    "title": "Team Meeting",
-    "starts_at": "2024-01-15T10:00:00",
-    "ends_at": "2024-01-15T11:00:00"
-  }'
+  -d '{"id":"meeting1","title":"Sync","starts_at":"2024-01-15T10:00:00","ends_at":"2024-01-15T11:00:00"}'
 
-# List all events
+# List events
 curl http://localhost:8000/events/
-
-# Get specific event
-curl http://localhost:8000/events/event1
-
-# Update event
-curl -X PATCH http://localhost:8000/events/event1 \
-  -H "Content-Type: application/json" \
-  -d '{"title": "Updated Team Meeting"}'
-
-# Delete event
-curl -X DELETE http://localhost:8000/events/event1
 ```
 
-#### 3. Goal Board Tests
+### Goals (/goals)
 ```bash
-# Create a new goal
+# Create goal
 curl -X POST http://localhost:8000/goals/ \
   -H "Content-Type: application/json" \
-  -d '{
-    "id": "goal1",
-    "title": "Complete Project Milestone",
-    "description": "Finish the distributed system implementation",
-    "owner": "alice"
-  }'
-
-# List all goals
-curl http://localhost:8000/goals/
-
-# Mark goal as completed
-curl -X PATCH http://localhost:8000/goals/goal1 \
-  -H "Content-Type: application/json" \
-  -d '{"completed": true}'
-
-# Delete goal
-curl -X DELETE http://localhost:8000/goals/goal1
+  -d '{"id":"project1","title":"Complete System","owner":"team6"}'
 ```
 
-### System Integration Tests
-
-#### 4. Real-time Communication Test
+### Pomodoro Timer (/pomo)
 ```bash
-# Test 1: Start timer and verify real-time updates
-# In one terminal, start the server, then in another:
+# Start timer
 curl -X POST http://localhost:8000/pomo/start
-
-# You should see timer updates in the server logs
 ```
 
-#### 5. Pub/Sub System Test
+---
+
+## Demo Scenarios
+
+### 1. Calendar Conflict Detection (2PC)
 ```bash
-# Check pub/sub statistics
-curl http://localhost:8000/pubsub/stats
+# Terminal 1: Book 2pm slot
+curl -X POST http://localhost:8000/events/ \
+  -d '{"id":"e1","title":"Meeting","starts_at":"2024-12-20T14:00:00"}'
 
-# Trigger demo events
-curl http://localhost:8000/pubsub/demo
+# Terminal 2: Try same slot (will fail via 2PC)
+curl -X POST http://localhost:8000/events/ \
+  -d '{"id":"e2","title":"Conflict","starts_at":"2024-12-20T14:00:00"}'
+# Returns: {"detail":"time_slot_taken"}
 ```
 
-#### 6. Hybrid System Test
+### 2. P2P Timer Failure Recovery
 ```bash
-# Test the complete hybrid system
-python -c "
-from hybrid import HybridPlatform
-platform = HybridPlatform()
-platform.start_hybrid_system(start_clients=2)
-print('Hybrid system started with 2 P2P clients')
-import time
-time.sleep(10)
-platform.stop()
-"
+# Terminal 1: Start client as timer master
+python client.py
+> 1  # Start Timer
+
+# Terminal 2: Join as peer
+python client.py
+> 3  # Join Timer
+> localhost
+
+# Kill Terminal 1
+# Terminal 2 automatically promotes itself to master
 ```
 
-## Architecture & Components
-
-### PlatformServer (`server.py`)
-**Purpose**: Core real-time communication server handling TCP/UDP connections and state management.
-
-**Features**:
-- TCP/UDP socket server (TCP:9000, UDP:9001)
-- Real-time client synchronization
-- Thread-safe state management
-- Automatic client connection handling
-- Manages: Timer state, Calendar events, Goal updates
-
-**Run Independently**:
+### 3. Distributed Transactions
 ```bash
-python server.py
+python client.py
+> 4  # Begin Transaction (2PC)
+> 1  # Add Calendar Event
+> 3  # Commit Transaction
 ```
 
-### FastAPI Server (`main.py`)
-**Purpose**: REST API interface for web clients and external integrations.
+---
 
-**Features**:
-- FastAPI documentation at `/docs`
-- Automatic real-time broadcasting on API calls
-- Redis Pub/Sub integration
-- Go to: http://localhost:8000/docs
+## Project Structure
+- `main.py` - FastAPI server + socket server
+- `client.py` - CLI client with P2P timer
+- `api/` - REST API endpoints (calendar, goals, pomodoro)
+- `server/` - Distributed server with 2PC and transactions
+- `pubsub.py` - Redis Pub/Sub messaging
 
-**Run Independently**:
-```bash
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
-```
+## Milestone Implementation Summary
 
-### Redis Pub/Sub (`pubsub.py`)
-**Purpose**: Asynchronous message broadcasting with space and time uncoupling.
+### Milestone 1: Foundation
+- **Hybrid Architecture**: Client-server for data consistency, P2P for real-time sync
+- **Protocol Justification**: 
+  - TCP for reliable transactions (calendar bookings via 2PC)
+  - UDP for efficient timer broadcasts (tolerates packet loss)
+  - HTTP/REST for web integration
+  - Redis Pub/Sub for decoupled messaging
 
-**Features**:
-- Channel-based messaging
-- Background thread message processing
-- Decoupled component communication
+### Milestone 2: Communication Models
+- **Direct IPC**: TCP/UDP sockets in `server/platform_server.py` for real-time sync
+- **Remote Communication**: REST API in `api/` directory for web clients
+- **Indirect Communication**: Redis Pub/Sub in `pubsub.py` for event broadcasting
 
-**Channels**:
-- `timer_updates` - Timer state changes and ticks
-- `calendar_events` - Event creation and modifications
-- `goal_updates` - Goal changes and completions
-- `platform_events` - General system events
+### Milestone 3: Concurrency & P2P
+- **Concurrency**: Threading with locks (`DB_LOCK`, `self.lock`) protects shared resources
+- **P2P Design**: Hierarchical timer network with automatic leader election on failure
+- **Validation**: System tested with multiple simultaneous users and simulated failures
 
-## API Modules
+### Milestone 4: Coordination & Consistency
+- **Lamport Clocks**: Logical time in `client.py` ensures causal ordering
+- **2PC Protocol**: Complete implementation in `server/platform_server.py` for atomic commits
+- **Transaction Management**: Distributed locks prevent double-booking; timeout-based cleanup
 
-### Pomodoro Timer (`api/pomodoro.py`)
-**Purpose**: Synchronized team Pomodoro timer management.
-
-**Endpoints**:
-- `GET    /pomo/state` - Get current timer state
-- `POST   /pomo/start` - Start the timer
-- `POST   /pomo/set` - Set timer duration (minutes)
-
-### Calendar Management (`api/calendar.py`)
-**Purpose**: Shared team calendar with real-time event synchronization.
-
-**Endpoints**:
-- `GET    /events/` - List all events
-- `GET    /events/{event_id}` - Get specific event
-- `POST   /events/` - Create new event
-- `PUT    /events/{event_id}` - Replace event
-- `PATCH  /events/{event_id}` - Partial update
-- `DELETE /events/{event_id}` - Delete event
-
-### Goal Board (`api/goalboard.py`)
-**Purpose**: Collaborative team goal tracking and progress monitoring.
-
-**Endpoints**:
-- `GET    /goals/` - List all goals
-- `GET    /goals/{goal_id}` - Get specific goal
-- `POST   /goals/` - Create new goal
-- `PATCH  /goals/{goal_id}` - Update goal
-- `DELETE /goals/{goal_id}` - Delete goal
-
-## Testing
-
-### Performance
-```bash
-# Test concurrent connections
-for i in {1..10}; do
-  curl -X POST http://localhost:8000/events/ \
-    -H "Content-Type: application/json" \
-    -d "{\"id\": \"perf$i\", \"title\": \"Test Event $i\", \"starts_at\": \"2024-01-15T10:00:00\", \"ends_at\": \"2024-01-15T11:00:00\"}" &
-done
-wait
-```
-
-### Fault Tolerance
-```bash
-# Test system recovery
-# 1. Start the system
-# 2. Kill Redis server temporarily
-# 3. Restart Redis
-# 4. Verify system recovers and continues functioning
-```
-
-## Troubleshooting
-
-1. **Redis Connection Failed**
-   ```bash
-   # Check if Redis is running
-   redis-cli ping
-   # Start Redis if not running
-   redis-server
-   ```
-
-2. **Port Already in Use**
-   ```bash
-   # Find process using port
-   lsof -i :8000
-   # Kill the process or use different port
-   ```
-
-## Dependencies
-
-### Core Dependencies
-```txt
-fastapi>=0.104.0
-uvicorn>=0.24.0
-redis>=5.0.0
-pydantic>=2.0.0
-requests>=2.31.0
-```
+## Validation
+- Tested with 5+ concurrent clients
+- Simulated network partitions and node failures
+- Verified conflict detection in calendar bookings
+- Confirmed P2P timer recovery on leader failure

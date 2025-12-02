@@ -1,4 +1,16 @@
-# main.py
+"""
+Main entry point for GroupSync.
+
+This file orchestrates:
+- FastAPI REST API server
+- Distributed PlatformServer nodes
+- Redis Pub/Sub integration
+- 2PC coordination simulation
+
+Architecture: Hybrid client-server + P2P with distributed transactions
+Protocols: TCP, UDP, HTTP, Redis Pub/Sub
+"""
+
 import threading
 import time
 import logging
@@ -12,10 +24,11 @@ from pubsub import publish
 from subscribe import start_global_subscriber
 from coordination import Coordinator, Participant
 
+# Configure logging for debugging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Global state
+# Global state for distributed nodes
 servers = {}
 coordinator = None
 calendar_node = None
@@ -24,37 +37,42 @@ subscriber_manager = None
 demo_coordinator = None
 
 def initialize_system():
+    """
+    Initialize the entire distributed system:
+    1. Launches distributed server nodes (coordinator, goals, calendar)
+    2. Injects socket server dependencies into API routers
+    3. Initializes Redis Pub/Sub system
+    4. Sets up 2PC coordination simulation
+    """
     global servers, coordinator, calendar_node, goals_node, subscriber_manager, demo_coordinator
     
     logger.info("Initializing Group Productivity Platform...")
     
-    # Launch distributed servers
+    # Step 1: Launch distributed servers using specialized nodes
     servers = launch_distributed_servers()
-    coordinator = servers.get('S1')
-    goals_node = servers.get('S2')
-    calendar_node = servers.get('S3')
+    coordinator = servers.get('S1')  # Coordinator node
+    goals_node = servers.get('S2')   # Goals specialization node
+    calendar_node = servers.get('S3')  # Calendar specialization node
     
-    # Inject dependencies into API routers
+    # Step 2: Dependency injection for API routers
+    # Connects the REST API layer with the socket communication layer
     if coordinator:
-        from api import calendar, pomodoro, goalboard
         calendar.set_socket_server(coordinator)
         pomodoro.set_socket_server(coordinator)
         goalboard.set_socket_server(coordinator)
         
-        logger.info(f"Calendar socket_server after injection: {calendar.get_socket_server()}")
-        logger.info(f"Calendar socket_server type: {type(calendar.get_socket_server())}")
-        logger.info(f"Has _broadcast_tcp_message: {hasattr(calendar.get_socket_server(), '_broadcast_tcp_message')}")
+        logger.info(f"Socket server injected into API routers")
     else:
-        logger.error("NO COORDINATOR AVAILABLE!")
+        logger.error("NO COORDINATOR AVAILABLE! Falling back to single server mode.")
         
-    # Initialize pub/sub
+    # Step 3: Initialize Pub/Sub system for indirect communication
     try:
         subscriber_manager = start_global_subscriber()
-        logger.info("Pub/Sub system ready")
+        logger.info("Pub/Sub system ready for decoupled messaging")
     except Exception as e:
         logger.warning(f"Pub/Sub initialization failed: {e}")
     
-    # Initialize 2PC demo
+    # Step 4: Initialize 2PC coordination demo
     participants = [
         Participant("Bryan"),
         Participant("Cole"),
@@ -63,25 +81,27 @@ def initialize_system():
         Participant("Emmanuel")
     ]
     demo_coordinator = Coordinator(participants)
+    logger.info("2PC coordination system initialized")
 
-
-# Create FastAPI app FIRST
+# Create FastAPI app with metadata
 app = FastAPI(
-    title="Group Productivity Platform API",
-    description="Distributed system with 2PC transactions and hybrid architecture",
-    version="3.0.0",
+    title="GroupSync API",
     docs_url="/api/docs",
     redoc_url="/api/redoc"
 )
 
-# Include routers
+# Include REST API routers
 app.include_router(calendar.router)
 app.include_router(pomodoro.router)
 app.include_router(goalboard.router)
 
 @app.get("/")
 def read_root():
-    # Check if socket_server is actually set
+    """
+    Root endpoint provides system overview.
+    
+    Returns basic information about the distributed system architecture and available endpoints.
+    """
     socket_status = "available" if calendar.get_socket_server() else "unavailable"
     return {
         "message": "Group Productivity Platform",
@@ -99,6 +119,17 @@ def read_root():
 
 @app.get("/health")
 def health_check():
+    """
+    Health check endpoint for monitoring distributed system status.
+    
+    Checks availability of all components:
+    - Coordinator node
+    - Specialized nodes (calendar, goals)
+    - Pub/Sub system
+    - Socket server injection status
+    
+    Used for system monitoring and debugging. So much debugging.
+    """
     socket_available = calendar.get_socket_server() is not None
     socket_has_method = hasattr(calendar.get_socket_server(), '_broadcast_tcp_message') if socket_available else False
     
@@ -117,6 +148,16 @@ def health_check():
 
 @app.get("/debug/injection")
 def debug_injection():
+    """
+    Debug endpoint to verify dependency injection status.
+    
+    Troubleshoot connection between:
+    - REST API layer (FastAPI)
+    - Socket communication layer (PlatformServer)
+    - Distributed transaction coordination
+    
+    Returns info about socket server injection.
+    """
     from api import calendar, pomodoro, goalboard
     
     return {
@@ -131,14 +172,21 @@ def debug_injection():
 
 @app.on_event("startup")
 async def startup_event():
+    """
+    FastAPI startup event handler.
+    
+    Initializes the distributed system when the FastAPI server starts.
+    Ensures all components are ready before handling requests.
+    """
     logger.info("FastAPI starting up - initializing system...")
     initialize_system()
 
 if __name__ == "__main__":
+    # Start the combined FastAPI + socket server system
     uvicorn.run(
         "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
+        host="0.0.0.0",  # Bind to all interfaces
+        port=8000,        # HTTP port for REST API
+        reload=True,      # Development mode auto-reload
         log_level="info"
     )

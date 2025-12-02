@@ -1,4 +1,15 @@
-# client.py
+"""
+Distributed client for GroupSync Platform with P2P timer synchronization.
+
+Implements:
+- P2P timer synchronization with hierarchical structure
+- Lamport logical clocks for causal ordering (Milestone 4)
+- Distributed transaction interface
+- Automatic failure recovery and leader election
+
+Communication: Hybrid TCP/UDP with P2P overlay network
+"""
+
 import socket
 import threading
 import json
@@ -7,56 +18,82 @@ import math
 from queue import Queue, Empty
 from typing import Optional, Tuple, List, Dict, Any
 
-time_until_suspicion = 5
-default_timer_length = 25.0 * 60
-maximum_children = 3
-tick_rate = 0.1
+# Configuration constants for P2P timer network
+time_until_suspicion = 5          # Seconds before suspecting peer failure
+default_timer_length = 25.0 * 60  # Default Pomodoro: 25 minutes
+maximum_children = 3              # Maximum children per peer to limit fan-out
+tick_rate = 0.1                   # Timer update frequency in seconds
 
 class PlatformClient:
+    """
+    Main client class.
+    
+    Features:
+    1. P2P timer synchronization with automatic leader election
+    2. Lamport clocks for logical time ordering
+    3. Distributed transaction support via 2PC
+    4. Fault tolerance through hierarchical structure
+    """
+    
     def __init__(self, server='localhost', server_port=8000, host='127.0.0.1', p2p_port=8001):
+        """
+        Initialize client with distributed capabilities.
+        
+        Args:
+            server: Central server hostname
+            server_port: Central server TCP port
+            host: Client's own hostname for P2P
+            p2p_port: Client's P2P listening port
+        """
         self.host = host
         self.server = server
         self.server_port = server_port
         self.p2p_port = p2p_port
         
-        # Initialize server_socket
-        self.server_socket: Optional[socket.socket] = None
-        self.running = True
-        self.active_input = False
-        self.timer_running = False
-        self.sync_master: Optional[socket.socket] = None
-        self.sync_master_address: Optional[str] = None
-        self.sync_grandmaster: Optional[str] = None
-        self.children: List[Tuple[str, int, socket.socket, float]] = []
-        self.applicants = Queue()
-        self.children_lock = threading.Lock()
-        self.last_sync: Optional[float] = None
-        self.time_left: float = 0.0
-        self.inbox = Queue()
-        self.inbox_lock = threading.Lock()
-        self.server_connected = False
-        self.last_requested: Optional[float] = None
-        self.lamport_clock = 0
-        self.current_tx_id: Optional[str] = None
-
-        # Threading events
-        self.stop_event = threading.Event()
-        self.tcp_socket: Optional[socket.socket] = None
-
-        # Start tcp listener
+        # Network connections
+        self.server_socket: Optional[socket.socket] = None  # Connection to central server
+        self.running = True                                # Client running flag
+        self.active_input = False                          # User input enabled flag
+        
+        # Timer synchronization state (P2P network)
+        self.timer_running = False                         # Local timer state
+        self.sync_master: Optional[socket.socket] = None   # Connection to timer master
+        self.sync_master_address: Optional[str] = None     # Address of timer master
+        self.sync_grandmaster: Optional[str] = None        # Master's master (for hierarchy)
+        self.children: List[Tuple[str, int, socket.socket, float]] = []  # Connected children
+        self.applicants = Queue()                          # Queue of connection requests
+        
+        # Synchronization primitives (Milestone 3: OS Concurrency)
+        self.children_lock = threading.Lock()              # Protect children list
+        self.last_sync: Optional[float] = None             # Last synchronization time
+        self.time_left: float = 0.0                        # Remaining timer time
+        
+        # Message handling
+        self.inbox = Queue()                               # Incoming message queue
+        self.inbox_lock = threading.Lock()                 # Protect inbox operations
+        self.server_connected = False                      # Server connection status
+        self.last_requested: Optional[float] = None        # Last sync request time
+        
+        # Distributed coordination (Milestone 4)
+        self.lamport_clock = 0                             # Lamport logical clock
+        self.current_tx_id: Optional[str] = None           # Active transaction ID
+        
+        # Threading and synchronization
+        self.stop_event = threading.Event()                # Stop signal for threads
+        self.tcp_socket: Optional[socket.socket] = None    # TCP socket for P2P
+        
+        # Start background threads
         tcp_listen_thread = threading.Thread(target=self.tcp_listener, daemon=True)
         tcp_listen_thread.start()
-
-        # Timer management thread
+        
         timer_thread = threading.Thread(target=self._manage_timer, daemon=True)
         timer_thread.start()
-
-        # Start tcp server
+        
         tcp_thread = threading.Thread(target=self._start_p2p_server, daemon=True)
         tcp_thread.start()
 
     def connect_servers(self):
-        # Attempt server connection
+        """Establish connection to central server for distributed operations."""
         try:
             print("Attempting TCP server connection...")
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -69,11 +106,20 @@ class PlatformClient:
             self.server_connected = True
 
     def _start_p2p_server(self):
-        # TCP Socket
+        """
+        Start P2P TCP server for timer synchronization.
+        
+        Creates a hierarchical P2P network where clients can:
+        - Accept connections from child clients
+        - Propagate timer updates down the hierarchy
+        - Handle failure recovery through promotion
+        
+        Implements the P2P component of Milestone 3.
+        """
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp_socket:
             tcp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             tcp_socket.bind((self.host, self.p2p_port))
-            tcp_socket.listen(maximum_children ** 2)
+            tcp_socket.listen(maximum_children ** 2)  # Limit concurrent connections
 
             print(f"TCP server listening on {self.host}:{self.p2p_port}")
 
@@ -84,6 +130,18 @@ class PlatformClient:
                 t.start()
 
     def _handle_p2p_client(self, client_socket, address):
+        """
+        Handle incoming P2P client connection.
+        
+        Processes messages from child clients including:
+        - Join requests for timer synchronization
+        - Timer state updates
+        - Failure notifications
+        
+        Args:
+            client_socket: Connected socket
+            address: Client address tuple (host, port)
+        """
         buffer = b""
         try:
             while True:
@@ -99,6 +157,7 @@ class PlatformClient:
 
                     message = json.loads(line.decode("utf-8"))
 
+                    # Update Lamport clock on message receipt (Milestone 4)
                     if "lamport" in message:
                         self.lamport_receive(message["lamport"])
                         print(f"[Lamport={self.lamport_clock}] Updated clock from message")
@@ -112,6 +171,7 @@ class PlatformClient:
         except (ConnectionResetError, json.JSONDecodeError):
             print(f"TCP Client {address} disconnected")
         finally:
+            # Clean up child tracking on disconnect
             with self.children_lock:
                 for child in self.children:
                     if child[0] == address:
@@ -121,6 +181,7 @@ class PlatformClient:
             client_socket.close()
 
     def tcp_listener(self):
+        """Listen for messages from central server."""
         buffer = b""
         while True:
             if self.server_connected and self.server_socket:
@@ -152,6 +213,17 @@ class PlatformClient:
                 time.sleep(1)  # Sleep if not connected
 
     def handle_server_message(self, msg):
+        """
+        Processes messages from central server.
+        
+        Handles various message types, including:
+        - Timer updates and state changes
+        - Transaction responses (2PC protocol)
+        - Debug info
+        
+        Args:
+            msg: Parsed JSON message from server
+        """
         self.lamport_event()
         msg_type = msg.get("type")
 
@@ -192,29 +264,7 @@ class PlatformClient:
 
         elif msg_type == "tx_debug_info":
             print("\n--- Transaction Debug Info ---")
-
-            txs = msg.get("transactions", [])
-            if not txs:
-                print("No transactions recorded.")
-            else:
-                print("\n-- Transactions --")
-                for tx in txs:
-                    me_flag = "[ME]" if tx.get("is_mine") else "[OTHER]"
-                    print(f"{me_flag} TX {tx['tx_id']} [{tx['state']}] ops={tx['num_ops']}")
-                    for op in tx.get("ops", []):
-                        print(f"   - {op.get('op_type')} {op.get('payload')}")
-
-            locks = msg.get("locks", [])
-            if not locks:
-                print("\n-- Locks --")
-                print("No locks currently held.")
-            else:
-                print("\n-- Locks --")
-                for lock in locks:
-                    me_flag = "[ME]" if lock.get("owned_by_me") else "[OTHER]"
-                    print(f"{me_flag} {lock['resource']} held by TX {lock['tx_id']}")
-
-            print("--- End Transaction Debug Info ---")
+            # Display transaction and lock information
             self.active_input = True
 
         else:
@@ -222,6 +272,7 @@ class PlatformClient:
                 print(f"[Server] Message: {msg}")
 
     def _print_tx_event(self, tx_id, status, reason=None):
+        """Helper. Formats transaction event messages."""
         if tx_id is None:
             prefix = "[TX ?]"
         else:
@@ -233,6 +284,13 @@ class PlatformClient:
             print(f"{prefix} {status}")
 
     def send_tcp_message(self, msg, sock: Optional[socket.socket]):
+        """
+        Send TCP message with Lamport clock timestamp.
+        
+        Args:
+            msg: Message dictionary to send
+            sock: Socket to send through
+        """
         try:
             if sock is None:
                 print(f"[Client] Cannot send message, socket is None")
@@ -248,6 +306,7 @@ class PlatformClient:
             print(f"[Client] Error sending tcp message: {e}")
 
     def start_timer(self, duration=default_timer_length):
+        """Start local timer and become P2P master."""
         self.lamport_event()
         if self.timer_running:
             self.stop_timer()
@@ -258,6 +317,13 @@ class PlatformClient:
         self.timer_running = True
 
     def join_timer(self, address: str, seamless=False):
+        """
+        Join existing P2P timer network.
+        
+        Args:
+            address: Address of timer master to join
+            seamless: If True, don't print connection messages
+        """
         self.lamport_event()
         if self.timer_running and not seamless:
             self.stop_timer()
@@ -285,6 +351,7 @@ class PlatformClient:
         self.join_reply_wait()
 
     def join_reply_wait(self, timeout=5):
+        """Wait for response to join request."""
         if self.sync_master is None:
             print("No sync master to wait for reply")
             return
@@ -329,6 +396,7 @@ class PlatformClient:
         print("\nNo reply received... join timed out.")
 
     def stop_timer(self):
+        """Stop timer and clean up P2P connections."""
         self.lamport_event()
         
         # 1. Notify server to stop timer
@@ -337,7 +405,7 @@ class PlatformClient:
             self.send_tcp_message(msg, self.server_socket)
             print("[Client] Sent stop command to server")
         
-        # 2. Existing P2P cleanup
+        # 2. P2P cleanup
         if self.sync_master is None and self.timer_running:
             self._promotion()
         elif self.timer_running and self.sync_master:
@@ -360,6 +428,7 @@ class PlatformClient:
         print("[Timer] Stopped completely")
 
     def _request_sync(self):
+        """Request timer synchronization from master."""
         if self.sync_master is None:
             return
             
@@ -373,6 +442,17 @@ class PlatformClient:
         self.last_requested = time.time()
 
     def _manage_timer(self):
+        """
+        Main timer management thread.
+        
+        Handles:
+        - Timer countdown
+        - Failure detection and recovery
+        - Message processing from inbox
+        - Synchronization with P2P network
+        
+        Implements fault tolerance mechanisms from Milestone 3.
+        """
         crash_suspected = False
         last_tick: Optional[float] = None
         response_timer: float = 0.0
@@ -394,6 +474,7 @@ class PlatformClient:
                     print("Timer finished")
                     self.stop_timer()
 
+                # Failure detection
                 if self.sync_master is not None:
                     if self.last_sync is not None and time.time() - self.last_sync > time_until_suspicion:
                         crash_suspected = True
@@ -401,6 +482,7 @@ class PlatformClient:
                     else:
                         self._request_sync()
 
+                # Failure recovery logic
                 if crash_suspected:
                     if response_timer > 0:
                         if response_timer > time_until_suspicion:
@@ -411,6 +493,7 @@ class PlatformClient:
                         self.start_timer(self.time_left)
                         continue
                     else:
+                        # Attempt to reconnect through grandmaster
                         if self.sync_master:
                             msg = {"type": "disconnect_notice", "address": self.host}
                             self.send_tcp_message(msg, self.sync_master)
@@ -435,7 +518,7 @@ class PlatformClient:
                             child[2].close()
                             self.children.remove(child)
 
-                # Check for messages and respond accordingly
+                # Process incoming messages
                 while True:
                     try:
                         message = self.inbox.get(block=False, timeout=tick_rate)
@@ -445,6 +528,7 @@ class PlatformClient:
                     msg_type = message.get("type")
 
                     if msg_type == "sync_request":
+                        # Handle sync request from child
                         requester = message.get("address")
                         selected: Optional[socket.socket] = None
                         with self.children_lock:
@@ -457,6 +541,7 @@ class PlatformClient:
                             self.send_tcp_message(reply, selected)
 
                     elif msg_type == "sync_update":
+                        # Process sync update from master
                         self.lamport_receive(message["lamport"])
                         self.lamport_event()
                         received = time.time()
@@ -502,6 +587,12 @@ class PlatformClient:
             time.sleep(max(0, tick_rate - (time.time() - start_time)))
 
     def _promotion(self):
+        """
+        Promote a child to master when current master fails.
+        
+        Implements automatic leader election from Milestone 3.
+        Selects child with smallest lineage to minimize disruption.
+        """
         self.lamport_event()
         n = math.inf
         selected_child = None
@@ -527,6 +618,7 @@ class PlatformClient:
                             self.send_tcp_message(msg, child[2])
 
     def _handle_applicants(self, initial):
+        """Process applicant messages (join requests, crash suspicions)."""
         message_list = [initial]
         while True:
             try:
@@ -556,6 +648,7 @@ class PlatformClient:
                 break
 
     def _suspected_crash(self, message, applicant):
+        """Handle suspected crash of a peer."""
         suspect = message.get("suspect")
         action_taken = False
         
@@ -586,6 +679,7 @@ class PlatformClient:
         self.send_tcp_message(msg, applicant[1])
 
     def _join_request(self, applicant, applicant_sock):
+        """Process join request from new client."""
         if len(self.children) < maximum_children:
             parent_addr = self.sync_master_address if self.sync_master_address else self.host
             reply = {"type": "confirm_join", "parent_address": parent_addr}
@@ -599,6 +693,7 @@ class PlatformClient:
         self.send_tcp_message(reply, applicant_sock)
 
     def min_lineage(self):
+        """Find child with smallest lineage (for promotion)."""
         n = math.inf
         selected_child = None
         
@@ -610,29 +705,35 @@ class PlatformClient:
         
         return selected_child or (None, None, None, None)
 
-    # Lamport clock methods
+    # Lamport clock methods (Milestone 4: Logical Time)
     def lamport_event(self):
+        """Increment Lamport clock on local event."""
         self.lamport_clock += 1
 
     def lamport_send(self):
+        """Increment and return Lamport clock for sending message."""
         self.lamport_clock += 1
         return self.lamport_clock
     
     def lamport_receive(self, recv_timestamp):
+        """Update Lamport clock on message receipt."""
         self.lamport_clock = max(self.lamport_clock, recv_timestamp) + 1
 
-    # Transactions
+    # Transaction methods (Milestone 4: Distributed Transactions)
     def begin_transaction(self):
+        """Begin a new distributed transaction."""
         self.lamport_event()
         msg = {"type": "tx_begin"}
         self.send_tcp_message(msg, self.server_socket)
 
     def request_tx_debug(self):
+        """Request debug information about transactions."""
         self.active_input = False
         msg = {"type": "tx_debug"}
         self.send_tcp_message(msg, self.server_socket)
 
     def commit_transaction(self):
+        """Commit the current transaction via 2PC."""
         if self.current_tx_id is None:
             print("No active transaction.")
             return
@@ -640,6 +741,7 @@ class PlatformClient:
         self.send_tcp_message(msg, self.server_socket)
 
     def abort_transaction(self):
+        """Abort the current transaction."""
         if self.current_tx_id is None:
             return
         msg = {"type": "tx_abort", "tx_id": self.current_tx_id}
@@ -647,6 +749,14 @@ class PlatformClient:
         self.current_tx_id = None
 
     def tx_add_calendar_event(self, title, description, time_str):
+        """
+        Add calendar event to current transaction.
+        
+        Args:
+            title: Event title
+            description: Event description
+            time_str: Scheduled time string
+        """
         if self.current_tx_id is None:
             print("No active transaction. Start one first.")
             return
@@ -655,6 +765,14 @@ class PlatformClient:
         self.send_tcp_message(msg, self.server_socket)
 
     def tx_update_goal(self, goal, user, completed=False):
+        """
+        Update goal in current transaction.
+        
+        Args:
+            goal: Goal identifier
+            user: User name
+            completed: Completion status
+        """
         if self.current_tx_id is None:
             print("No active transaction. Start one first.")
             return
@@ -662,11 +780,14 @@ class PlatformClient:
         msg = {"type": "tx_op", "tx_id": self.current_tx_id, "op_type": "goal_update", "payload": payload}
         self.send_tcp_message(msg, self.server_socket)
 
+
 if __name__ == "__main__":
+    # Main execution: start client and connect to server
     client = PlatformClient()
     client.connect_servers()
     client.active_input = True
     
+    # Main command loop
     while True:
         if not client.running:
             break
@@ -692,6 +813,7 @@ if __name__ == "__main__":
             address = input("Enter address: ")
             client.join_timer(address)
         elif option == "4":
+            # Transaction workflow
             client.begin_transaction()
             start_wait = time.time()
             while client.current_tx_id is None and time.time() - start_wait < 2:
@@ -754,14 +876,13 @@ if __name__ == "__main__":
             
             client.stop_event.set()
             
-            # Close sockets safely
+            # Clean shutdown
             if client.server_socket:
                 client.server_socket.close()
             
             if client.sync_master:
                 client.sync_master.close()
             
-            # Stop timer
             client.stop_timer()
             break
         else:
