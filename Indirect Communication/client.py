@@ -37,7 +37,7 @@ class PlatformClient:
         self.inbox = Queue()  # used to pass messages from the tcp message handler to the timer management thread
         self.inbox_lock = threading.Lock()
         self.server_connected = False  # tracks if a connection has been made with the central server
-        self.last_requested = None  # last time a sync was requested
+        self.last_requested = time.time()  # last time a sync was requested
         self.lamport_clock = 0
 
         self.current_tx_id = None
@@ -131,6 +131,12 @@ class PlatformClient:
 
         except (ConnectionResetError, ConnectionAbortedError, json.JSONDecodeError):
             print(f"TCP Client {address} disconnected")
+
+        except OSError:
+            client_socket = None
+
+        except Exception as e:
+            print(f"Error: {e}")
 
         finally:
 
@@ -281,8 +287,7 @@ class PlatformClient:
     # Commands
     def start_timer(self, duration=default_timer_length):
         self.lamport_event()
-        if self.timer_running:
-            self.stop_timer()
+        self.stop_timer()
 
         self.sync_master = None  # this might end up being redundant
         self.sync_master_address = None
@@ -371,11 +376,13 @@ class PlatformClient:
         if self.sync_master is None and self.timer_running:  # if this is the master clock
             # designate another as master clock
             self._promotion()
+            self.timer_running = False
 
         elif self.timer_running:  # if this is not the master clock
             # send a message to our parent indicating we are disconnecting
             msg = {"type": "disconnect_notice",
                    "address": self.host}
+            self.timer_running = False
             self.send_tcp_message(msg, self.sync_master)
             self.sync_master.close()
 
@@ -388,7 +395,7 @@ class PlatformClient:
         self.sync_master = None
         self.sync_master_address = None
         self.sync_grandmaster = None
-        self.timer_running = False
+
 
     # Timer functions
     def _request_sync(self):
@@ -447,8 +454,9 @@ class PlatformClient:
                     # check how long since last contact
                     if time.time() - self.last_sync > time_until_suspicion:
                         crash_suspected = True
+                        #print("Parent crash suspected")
                         self.lamport_event()
-                    elif time.time() - self.last_sync > tick_rate * 5: # requests a sync once every 5 ticks
+                    elif time.time() - self.last_requested > tick_rate * 5: # requests a sync once every 5 ticks
                         self._request_sync()
 
                 # this is also where we do failure handling
@@ -519,9 +527,9 @@ class PlatformClient:
                     elif msg_type == "sync_update":
                         self.lamport_receive(message["lamport"])
                         self.lamport_event()
-                        received = time.time()
+                        self.last_sync = time.time()
                         try:
-                            self.time_left = message.get("time") - (received - self.last_requested)/2  # uses Cristian's Method for syncing
+                            self.time_left = message.get("time") - (self.last_sync - self.last_requested)/2  # uses Cristian's Method for syncing
                             self.sync_grandmaster = message.get("grandparent")
                         except TypeError:
                             print("Syncing error: Update was received without being requested")
